@@ -1318,15 +1318,17 @@ if __name__ == '__main__':
             print(f"可用非交易日任务: {list(NON_TRADING_TASKS.keys())}")
             sys.exit(1)
 
-        # 严格类型校验
-        if task_name in TRADING_TASKS:
-            if not is_td:
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏭️ 跳过任务 [{task_name}] — 今日({weekday_name} {today_str})是非交易日")
-                sys.exit(0)
-        elif task_name in NON_TRADING_TASKS:
-            if is_td:
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏭️ 跳过任务 [{task_name}] — 今日({weekday_name} {today_str})是交易日")
-                sys.exit(0)
+        # 严格类型校验（step5_final 和 send_report 每天都会跑）
+        ALWAYS_RUN_TASKS = {'step5_final', 'send_report'}
+        if task_name not in ALWAYS_RUN_TASKS:
+            if task_name in TRADING_TASKS:
+                if not is_td:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏭️ 跳过任务 [{task_name}] — 今日({weekday_name} {today_str})是非交易日")
+                    sys.exit(0)
+            elif task_name in NON_TRADING_TASKS:
+                if is_td:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏭️ 跳过任务 [{task_name}] — 今日({weekday_name} {today_str})是交易日")
+                    sys.exit(0)
 
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ▶️ 执行任务 [{task_name}] | {weekday_name} {today_str} | {'交易日' if is_td else '非交易日'}")
 
