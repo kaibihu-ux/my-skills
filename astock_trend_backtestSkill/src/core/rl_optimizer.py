@@ -1,0 +1,591 @@
+"""
+强化学习优化器 - 动态仓位/择时
+使用 Q-Learning 纯 Python 实现，不依赖 tensorflow/pytorch
+"""
+
+import random
+import json
+import threading
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# 并行评估
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
+
+class RLOptimizer:
+    """
+    强化学习优化器 - 动态仓位/择时
+
+    状态空间: (market_regime, momentum_signal, volatility_signal) 各3种取值 = 27状态
+    行为空间: (满仓/半仓/空仓) = (1.0, 0.5, 0.0)
+    算法: Q-Learning
+    """
+
+    # 市场状态枚举
+    MARKET_REGIME_MAP = {-1: 'bear', 0: 'neutral', 1: 'bull'}
+
+    # 动量信号枚举
+    MOMENTUM_MAP = {-1: 'negative', 0: 'neutral', 1: 'positive'}
+
+    # 波动率信号枚举
+    VOL_MAP = {-1: 'low_vol', 0: 'medium_vol', 1: 'high_vol'}
+
+    # 动作: 0=空仓(0%), 1=半仓(50%), 2=满仓(100%)
+    ACTION_MAP = {0: 0.0, 1: 0.5, 2: 1.0}
+    ACTION_NAMES = {0: '空仓', 1: '半仓', 2: '满仓'}
+    N_ACTIONS = 3
+
+    def __init__(
+        self,
+        backtester,
+        logger,
+        start_date: str = None,
+        end_date: str = None,
+        gamma: float = 0.95,
+        alpha: float = 0.1,
+        epsilon: float = 0.1,
+        epsilon_decay: float = 0.98,
+        min_epsilon: float = 0.01,
+        n_episodes: int = 50,
+        lookback_days: int = 20,
+    ):
+        self.backtester = backtester
+        self.logger = logger
+        self.start_date = self._format_date(start_date) if start_date else '2020-01-01'
+        self.end_date = self._format_date(end_date) if end_date else '2026-03-27'
+
+        # Q-Learning 超参数（修复：移入 __init__，原位置是 unreachable bug）
+        self.gamma = gamma
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.min_epsilon = min_epsilon
+        self.n_episodes = n_episodes
+        self.lookback_days = lookback_days
+
+        # Q表: {(regime, momentum, vol): [Q(a0), Q(a1), Q(a2)]}
+        self.q_table: Dict[Tuple, List[float]] = defaultdict(
+            lambda: [0.0, 0.0, 0.0]
+        )
+
+        # 基准净值序列（用于计算状态）
+        self._nav_history: List[float] = []
+        self._price_history: Dict[str, List[float]] = {}
+
+        # ---- 检查点 ----
+        self._checkpoint_path: Optional[Path] = None
+        self._checkpoint_lock = threading.Lock()
+        self._training_history: List = []
+        self._current_episode: int = 0
+        self._current_episode_epsilon: float = epsilon
+
+    # ------------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------------
+
+    def _format_date(self, date_str: str) -> str:
+        """统一日期格式：YYYYMMDD -> YYYY-MM-DD"""
+        if date_str is None:
+            return ''
+        s = str(date_str)
+        if len(s) == 8 and s.isdigit():
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return s
+
+    def _save_checkpoint(self, force: bool = False):
+        """线程安全保存RL训练检查点（每10个episode调用）"""
+        if self._checkpoint_path is None:
+            return
+        with self._checkpoint_lock:
+            ckpt = {
+                'q_table': dict(self.q_table),
+                'training_history': self._training_history,
+                'current_episode': self._current_episode,
+                'current_epsilon': self._current_episode_epsilon,
+            }
+            tmp = str(self._checkpoint_path) + '.tmp'
+            self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, 'w') as f:
+                json.dump(ckpt, f, default=str)
+            Path(tmp).rename(self._checkpoint_path)
+            if force:
+                self.logger.info(f"[RL] 检查点已保存: {self._checkpoint_path}")
+
+    # ------------------------------------------------------------------
+    # 核心方法
+    # ------------------------------------------------------------------
+
+    def optimize(
+        self,
+        strategy: Dict,
+        base_params: Dict = None,
+        use_rl_position: bool = True,
+    ) -> Dict:
+        """
+        训练 Q-Learning 策略，返回 Q 表和最优策略
+
+        Args:
+            strategy: 基础选股策略（因子列表等）
+            base_params: 基础策略参数
+            use_rl_position: 是否用 RL 动态仓位（True=RL仓位, False=固定满仓）
+
+        Returns:
+            {
+                'q_table': {...},
+                'best_policy': {...},
+                'training_history': [{'episode': int, 'total_reward': float, 'epsilon': float}, ...],
+                'final_sharpe': float,
+            }
+        """
+        self.logger.info(
+            f"[RL] 开始训练 | Episodes={self.n_episodes}, gamma={self.gamma}, "
+            f"alpha={self.alpha}, initial_epsilon={self.epsilon}"
+        )
+
+        # 1. 准备历史数据（获取市场状态序列）
+        self._prepare_market_data()
+
+        # 2. 初始化 Q 表
+        self.q_table = defaultdict(lambda: [0.0, 0.0, 0.0])
+
+        # 自动设置检查点路径
+        if self._checkpoint_path is None:
+            try:
+                ckpt_dir = Path(__file__).parent.parent / "checkpoints"
+                ckpt_dir.mkdir(exist_ok=True)
+                self._checkpoint_path = ckpt_dir / "rl_checkpoint.json"
+            except Exception:
+                pass
+
+        training_history = []
+        current_epsilon = self.epsilon
+
+        for episode in range(self.n_episodes):
+            episode_reward, episode_actions = self._run_episode(
+                strategy=strategy,
+                base_params=base_params or {},
+                epsilon=current_epsilon,
+                use_rl_position=use_rl_position,
+            )
+
+            # 衰减 epsilon
+            current_epsilon = max(
+                self.min_epsilon, current_epsilon * self.epsilon_decay
+            )
+
+            training_history.append({
+                'episode': episode,
+                'total_reward': float(episode_reward),
+                'epsilon': float(current_epsilon),
+                'actions': episode_actions,
+            })
+
+            # 更新 checkpoint 跟踪状态
+            self._training_history = training_history
+            self._current_episode = episode
+            self._current_episode_epsilon = current_epsilon
+
+            # 每10个episode保存检查点
+            if episode > 0 and episode % 10 == 0:
+                self._save_checkpoint(force=True)
+
+            if episode % 10 == 0 or episode == self.n_episodes - 1:
+                avg_reward = episode_reward / max(1, len(episode_actions))
+                self.logger.info(
+                    f"[RL] Episode {episode:3d}/{self.n_episodes} | "
+                    f"Reward={episode_reward:.4f} | Avg={avg_reward:.4f} | "
+                    f"epsilon={current_epsilon:.4f}"
+                )
+
+        # 最终检查点
+        self._save_checkpoint(force=True)
+
+        # 3. 提取最优策略
+        best_policy = self._extract_policy()
+
+        # 4. 用最优策略跑最终回测
+        final_sharpe = self._eval_policy(strategy, base_params or {}, best_policy, use_rl_position)
+
+        # 5. 转换为可序列化格式
+        q_table_serializable = {
+            f"{k[0]},{k[1]},{k[2]}": v for k, v in self.q_table.items()
+        }
+
+        self.logger.info(f"[RL] 训练完成 | 最终Sharpe={final_sharpe:.4f}")
+
+        return {
+            'q_table': q_table_serializable,
+            'best_policy': best_policy,
+            'training_history': training_history,
+            'final_sharpe': float(final_sharpe),
+            'n_states': len(self.q_table),
+            'n_episodes': self.n_episodes,
+        }
+
+    # ------------------------------------------------------------------
+    # Episode 训练
+    # ------------------------------------------------------------------
+
+    def _run_episode(
+        self,
+        strategy: Dict,
+        base_params: Dict,
+        epsilon: float,
+        use_rl_position: bool,
+    ) -> Tuple[float, List[int]]:
+        """
+        运行一个 episode（相当于一次回测 + Q学习更新）
+        返回: (总奖励, 动作序列)
+        """
+        # 重置持仓和现金
+        cash = self.backtester.initial_cash
+        positions = {}  # {ts_code: {'shares': int, 'cost': float}}
+        nav_history = []
+        episode_reward = 0.0
+        actions_taken = []
+
+        dates = self._get_trade_dates()
+
+        for i, date in enumerate(dates):
+            # 获取当前状态
+            state = self._get_state(date, cash, positions, nav_history)
+
+            # epsilon-greedy 选择动作
+            action_idx = self._choose_action(state, epsilon)
+            actions_taken.append(action_idx)
+            position_ratio = self.ACTION_MAP[action_idx]
+
+            # 执行交易（带 RL 仓位比例）
+            cash, positions = self._execute_with_position(
+                date=date,
+                strategy=strategy,
+                base_params=base_params,
+                positions=positions,
+                cash=cash,
+                position_ratio=position_ratio,
+            )
+
+            # 计算持仓市值
+            portfolio_value = cash + self._get_positions_value(date, positions)
+
+            # 获取下一个状态（实际上状态转移由市场推动）
+            next_date = dates[i + 1] if i + 1 < len(dates) else date
+            next_state = self._get_state(next_date, cash, positions, nav_history)
+
+            # 计算奖励 = 当日收益率
+            old_nav = nav_history[-1] if nav_history else self.backtester.initial_cash
+            new_nav = portfolio_value
+            reward = self._get_reward(old_nav, new_nav)
+
+            # Q-Learning 更新
+            self._update_q(self.q_table, state, action_idx, reward, next_state)
+
+            nav_history.append(new_nav)
+            episode_reward += reward
+
+        return episode_reward, actions_taken
+
+    # ------------------------------------------------------------------
+    # 状态 & 奖励
+    # ------------------------------------------------------------------
+
+    def _get_state(
+        self,
+        date: str,
+        portfolio_value: float,
+        positions: Dict,
+        nav_history: List[float],
+    ) -> Tuple[int, int, int]:
+        """
+        离散化状态：
+        - market_regime: 基于最近 lookback_days 的指数收益率
+        - momentum_signal: 基于持仓股票近期动能
+        - volatility_signal: 基于近期波动率
+        """
+        # 市场状态：对比基准指数收益率
+        market_ret = self._get_market_return(date)
+        if market_ret > 0.02:
+            market_regime = 1   # 牛市
+        elif market_ret < -0.02:
+            market_regime = -1  # 熊市
+        else:
+            market_regime = 0   # 震荡
+
+        # 动量信号：基于持仓或市场近期走势
+        momentum_ret = self._get_momentum_return(date)
+        if momentum_ret > 0.01:
+            momentum_signal = 1
+        elif momentum_ret < -0.01:
+            momentum_signal = -1
+        else:
+            momentum_signal = 0
+
+        # 波动率信号
+        vol = self._get_volatility(date)
+        if vol > 0.03:
+            vol_signal = 1   # 高波动
+        elif vol < 0.015:
+            vol_signal = -1  # 低波动
+        else:
+            vol_signal = 0   # 中等波动
+
+        return (market_regime, momentum_signal, vol_signal)
+
+    def _get_reward(self, old_nav: float, new_nav: float) -> float:
+        """奖励 = 对数收益率"""
+        if old_nav <= 0:
+            return 0.0
+        return float(np.log(new_nav / old_nav))
+
+    # ------------------------------------------------------------------
+    # Q-Learning 核心
+    # ------------------------------------------------------------------
+
+    def _choose_action(self, state: Tuple, epsilon: float) -> int:
+        """epsilon-greedy 动作选择"""
+        if random.random() < epsilon:
+            return random.randint(0, self.N_ACTIONS - 1)
+        else:
+            q_values = self.q_table[state]
+            return int(np.argmax(q_values))
+
+    def _update_q(
+        self,
+        q_table: Dict,
+        state: Tuple,
+        action: int,
+        reward: float,
+        next_state: Tuple,
+    ) -> Dict:
+        """Q-Learning 更新公式"""
+        current_q = q_table[state][action]
+        max_next_q = max(q_table[next_state]) if next_state in q_table else 0.0
+        new_q = current_q + self.alpha * (reward + self.gamma * max_next_q - current_q)
+        q_table[state][action] = new_q
+        return q_table
+
+    def _extract_policy(self) -> Dict:
+        """从 Q 表提取确定性最优策略"""
+        policy = {}
+        for state, q_values in self.q_table.items():
+            best_action = int(np.argmax(q_values))
+            policy[f"{state[0]},{state[1]},{state[2]}"] = {
+                'action_idx': best_action,
+                'action_name': self.ACTION_NAMES[best_action],
+                'position_ratio': self.ACTION_MAP[best_action],
+                'q_value': float(q_values[best_action]),
+                'all_q': [float(q) for q in q_values],
+            }
+        return policy
+
+    def _eval_policy(
+        self,
+        strategy: Dict,
+        base_params: Dict,
+        policy: Dict,
+        use_rl_position: bool,
+    ) -> float:
+        """用最优策略跑回测，返回夏普"""
+        cash = self.backtester.initial_cash
+        positions = {}
+        nav_history = []
+        dates = self._get_trade_dates()
+
+        for date in dates:
+            state = self._get_state(date, cash, positions, nav_history)
+            state_key = f"{state[0]},{state[1]},{state[2]}"
+
+            if use_rl_position and state_key in policy:
+                position_ratio = policy[state_key]['position_ratio']
+            else:
+                position_ratio = 1.0  # 默认满仓
+
+            cash, positions = self._execute_with_position(
+                date=date,
+                strategy=strategy,
+                base_params=base_params,
+                positions=positions,
+                cash=cash,
+                position_ratio=position_ratio,
+            )
+
+            portfolio_value = cash + self._get_positions_value(date, positions)
+            nav_history.append(portfolio_value)
+
+        # 计算夏普
+        if len(nav_history) < 2:
+            return 0.0
+
+        nav_series = pd.Series(nav_history)
+        returns = nav_series.pct_change().dropna()
+        risk_free = 0.03
+        if returns.std() > 0:
+            sharpe = (returns.mean() * 252 - risk_free) / (returns.std() * np.sqrt(252))
+        else:
+            sharpe = 0.0
+
+        return float(sharpe)
+
+    # ------------------------------------------------------------------
+    # 辅助方法
+    # ------------------------------------------------------------------
+
+    def _prepare_market_data(self):
+        """预加载市场指数数据（用于状态计算）"""
+        self._nav_history = []
+        self._price_history = {}
+
+        try:
+            index_df = self.backtester.store.df(
+                f"""SELECT trade_date, close FROM stock_daily
+                    WHERE ts_code = '000001.SH'
+                    AND trade_date BETWEEN '{self.start_date}' AND '{self.end_date}'
+                    ORDER BY trade_date"""
+            )
+            if not index_df.empty:
+                self._nav_history = index_df['close'].tolist()
+        except Exception as e:
+            self.logger.warning(f"[RL] 加载市场数据失败: {e}")
+
+    def _get_trade_dates(self) -> List[str]:
+        """获取回测期交易日期列表"""
+        df = self.backtester.store.df(
+            f"""SELECT DISTINCT trade_date FROM stock_daily
+                WHERE trade_date BETWEEN '{self.start_date}' AND '{self.end_date}'
+                ORDER BY trade_date"""
+        )
+        return df['trade_date'].astype(str).tolist()
+
+    def _get_market_return(self, date: str) -> float:
+        """获取截至 date 的市场指数收益率"""
+        try:
+            idx_prices = self.backtester.store.df(
+                f"""SELECT trade_date, close FROM stock_daily
+                    WHERE ts_code = '000001.SH'
+                    AND trade_date <= '{date}'
+                    ORDER BY trade_date DESC
+                    LIMIT {self.lookback_days}"""
+            )
+            if len(idx_prices) >= 2:
+                ret = (idx_prices.iloc[0]['close'] - idx_prices.iloc[-1]['close']) \
+                      / idx_prices.iloc[-1]['close']
+                return float(ret)
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_momentum_return(self, date: str) -> float:
+        """获取近期动量收益"""
+        try:
+            dt = pd.to_datetime(date)
+            start_dt = dt - pd.Timedelta(days=int(self.lookback_days * 1.5))
+            start_str = start_dt.strftime('%Y-%m-%d')
+
+            mom_df = self.backtester.store.df(
+                f"""SELECT AVG(value) as avg_mom FROM factors
+                    WHERE factor_name = 'momentum_20'
+                    AND trade_date BETWEEN '{start_str}' AND '{date}'
+                    AND value IS NOT NULL"""
+            )
+            if not mom_df.empty and mom_df.iloc[0]['avg_mom'] is not None:
+                return float(mom_df.iloc[0]['avg_mom'])
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_volatility(self, date: str) -> float:
+        """获取近期波动率"""
+        try:
+            dt = pd.to_datetime(date)
+            start_dt = dt - pd.Timedelta(days=int(self.lookback_days * 1.5))
+            start_str = start_dt.strftime('%Y-%m-%d')
+
+            vol_df = self.backtester.store.df(
+                f"""SELECT AVG(value) as avg_vol FROM factors
+                    WHERE factor_name = 'volatility_20'
+                    AND trade_date BETWEEN '{start_str}' AND '{date}'
+                    AND value IS NOT NULL"""
+            )
+            if not vol_df.empty and vol_df.iloc[0]['avg_vol'] is not None:
+                return float(vol_df.iloc[0]['avg_vol'])
+        except Exception:
+            pass
+        return 0.02  # 默认中等波动
+
+    def _execute_with_position(
+        self,
+        date: str,
+        strategy: Dict,
+        base_params: Dict,
+        positions: Dict,
+        cash: float,
+        position_ratio: float = 1.0,
+    ) -> Tuple[float, Dict]:
+        """
+        带仓位的交易执行
+        position_ratio: 0.0=空仓, 0.5=半仓, 1.0=满仓
+        """
+        # 调用底层回测器的选股逻辑，获取当日信号
+        # 为了不重复造轮子，这里直接复用 backtester._get_signals
+        try:
+            signals = self.backtester._get_signals(
+                date=date,
+                strategy=strategy,
+                params=base_params,
+                positions=positions,
+                current_holdings={},
+                rebalance_dates={date},  # 每日都评估
+            )
+        except Exception:
+            signals = []
+
+        slippage = self.backtester.slippage
+        commission = self.backtester.commission
+
+        for signal in signals:
+            ts_code = signal['ts_code']
+            direction = signal['direction']
+            price = signal['price']
+
+            if direction == 'buy' and cash > 0:
+                # 按 position_ratio 决定实际仓位
+                invest_amount = cash * position_ratio
+                shares = int(invest_amount * 0.1 / (price * (1 + slippage)))
+                if shares > 0:
+                    cost = shares * price * (1 + slippage + commission)
+                    cash -= cost
+                    positions[ts_code] = {
+                        'shares': shares,
+                        'cost': price,
+                    }
+
+            elif direction == 'sell' and ts_code in positions:
+                pos = positions[ts_code]
+                proceeds = pos['shares'] * price * (1 - slippage - commission)
+                cash += proceeds
+                del positions[ts_code]
+
+        return cash, positions
+
+    def _get_positions_value(self, date: str, positions: Dict) -> float:
+        """计算持仓市值"""
+        total = 0.0
+        for ts_code, pos in positions.items():
+            try:
+                df = self.backtester.store.df(
+                    f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'"
+                )
+                if not df.empty:
+                    total += pos['shares'] * float(df.iloc[0]['close'])
+            except Exception:
+                pass
+        return total

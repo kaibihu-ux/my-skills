@@ -1,0 +1,196 @@
+# A股量化因子工厂 · 功能流程图
+
+```mermaid
+flowchart TD
+    %% Entry
+    START([系统启动]) --> INIT[初始化]
+    INIT --> LOAD_CONFIG[加载配置]
+    LOAD_CONFIG --> INIT_DB[初始化DuckDB]
+    INIT_DB --> INIT_SCHEDULER[初始化调度器]
+    INIT_SCHEDULER --> WAIT_T1{等待定时任务}
+    
+    %% Data Pipeline
+    WAIT_T1 -->|00:00 数据更新| DATA_UPDATE[下载最新行情]
+    DATA_UPDATE --> FETCH_DAILY[日线数据]
+    FETCH_DAILY --> FETCH_FIN[财务数据]
+    FETCH_FIN --> FETCH_HKT[北向资金]
+    FETCH_HKT --> STORE_DUCK[存储到DuckDB]
+    STORE_DUCK --> DATA_DONE[数据更新完成]
+    
+    %% Factor Mining Pipeline
+    DATA_DONE -->|01:00 因子挖掘| MINER_START[启动因子挖掘]
+    MINER_START --> GEN_TECH[技术因子候选]
+    GEN_TECH --> GEN_FUND[基本面因子候选]
+    GEN_FUND --> GEN_CROSS[量价交叉因子候选]
+    GEN_CROSS --> GEN_COMPOSITE[复合因子候选]
+    
+    GEN_TECH --> MERGE_CAND[合并候选因子]
+    GEN_FUND --> MERGE_CAND
+    GEN_CROSS --> MERGE_CAND
+    GEN_COMPOSITE --> MERGE_CAND
+    
+    MERGE_CAND --> CALC_FACTORS[批量计算因子值]
+    CALC_FACTORS --> EVAL_IC{评估IC}
+    EVAL_IC -->|IC < 0.02| REJECT_FACTOR[淘汰因子]
+    EVAL_IC -->|IC >= 0.02| EVAL_IR{评估IR}
+    EVAL_IR -->|IR < 0.3| REJECT_FACTOR
+    EVAL_IR -->|IR >= 0.3| ADD_POOL[进入因子池]
+    
+    REJECT_FACTOR --> DISCARD
+    ADD_POOL --> POOL_UPDATE[因子池更新]
+    
+    %% Factor Evaluation
+    POOL_UPDATE -->|03:00 因子评估| EVAL_ALL[评估所有因子]
+    EVAL_ALL --> CALC_IC_IR[计算IC/IR序列]
+    CALC_IC_IR --> GROUP_TEST[分组回测]
+    GROUP_TEST --> DECAY_TEST[衰减分析]
+    DECAY_TEST --> RANK_POOL[因子池重排]
+    RANK_POOL --> APPLY_RULES{优胜劣汰}
+    
+    APPLY_RULES -->|IR > 1.0| PROMOTE[⭐升级-核心因子]
+    APPLY_RULES -->|IR > 0.5| KEEP[✅保留-可用因子]
+    APPLY_RULES -->|IR > 0.3| DEMOTE[🔶降级-观察因子]
+    APPLY_RULES -->|IR < 0.3| EVICT[❌淘汰出池]
+    
+    PROMOTE --> POOL_DONE
+    KEEP --> POOL_DONE
+    DEMOTE --> POOL_DONE
+    EVICT --> POOL_DONE
+    
+    %% Strategy Generation
+    POOL_DONE -->|05:00 策略生成| SELECT_FACTORS[选取Top因子]
+    SELECT_FACTORS --> BUILD_SIGNALS[构建信号模板]
+    BUILD_SIGNALS --> GEN_PARAMS[参数空间生成]
+    GEN_PARAMS --> OPTIMIZE_PARAMS[参数优化]
+    OPTIMIZE_PARAMS --> GEN_STRATEGIES[生成策略候选]
+    
+    %% Backtest
+    GEN_STRATEGIES -->|07:00 全市场回测| BT_SETUP[回测准备]
+    BT_SETUP --> LOAD_STOCKS[加载主板股票]
+    LOAD_STOCKS --> GET_DATA[获取历史数据]
+    GET_DATA --> RUN_BACKTEST[逐日回测]
+    
+    RUN_BACKTEST --> FOR_EACH_DAY{遍历每日}
+    FOR_EACH_DAY -->|有数据| CHECK_SIGNALS[检查信号]
+    CHECK_SIGNALS -->|有信号| GEN_ORDERS[生成订单]
+    CHECK_SIGNALS -->|无信号| NEXT_D
+    
+    GEN_ORDERS --> RISK_CHECK[风控检查]
+    RISK_CHECK -->|通过| EXEC_ORDER[执行订单]
+    RISK_CHECK -->|失败| SKIP[跳过]
+    
+    EXEC_ORDER --> UPDATE_POS[更新持仓]
+    SKIP --> NEXT_D
+    UPDATE_POS --> CALC_PNL[计算盈亏]
+    CALC_PNL --> NEXT_D
+    
+    NEXT_D[下一日] --> FOR_EACH_DAY
+    FOR_EACH_DAY -->|完成| CALC_PERF[计算绩效]
+    
+    %% Performance Analysis
+    CALC_PERF --> CALC_SHARPE[夏普比率]
+    CALC_PERF --> CALC_MDD[最大回撤]
+    CALC_PERF --> CALC_WINRATE[胜率/盈亏比]
+    CALC_SHARPE --> RANK_STRAT[策略排名]
+    CALC_MDD --> RANK_STRAT
+    CALC_WINRATE --> RANK_STRAT
+    
+    RANK_STRAT -->|Sharpe > 1.5| PROMOTE_STRAT[🚀实盘候选]
+    RANK_STRAT -->|Sharpe > 1.0| KEEP_STRAT[📈模拟跟踪]
+    RANK_STRAT -->|Sharpe > 0.5| ARCHIVE_STRAT[📝存档观察]
+    RANK_STRAT -->|Sharpe < 0.5| EVICT_STRAT[🗑️淘汰]
+    
+    %% Report & Alert
+    PROMOTE_STRAT --> REPORT
+    KEEP_STRAT --> REPORT
+    ARCHIVE_STRAT --> REPORT
+    EVICT_STRAT --> REPORT
+    
+    REPORT -->|15:30 日报| GEN_HTML[生成HTML报告]
+    GEN_HTML --> GEN_TRADES_CSV[交易明细CSV]
+    GEN_TRADES_CSV --> GEN_DAILY_SUMMARY[每日总结]
+    
+    GEN_DAILY_SUMMARY -->|18:00| REBALANCE_POOL[因子池再平衡]
+    REBALANCE_POOL --> WAIT_T2{等待下一轮}
+    
+    WAIT_T2 -->|次日00:00| DATA_UPDATE
+    
+    %% Alerter
+    ALERT_TRIGGER{告警触发}
+    ALERT_TRIGGER -->|因子池异常| SEND_FEISHU[飞书通知]
+    ALERT_TRIGGER -->|策略亏损超限| SEND_FEISHU
+    ALERT_TRIGGER -->|数据获取失败| SEND_FEISHU
+    
+    %% Loop
+    WAIT_T1 -.->|循环| DATA_UPDATE
+    WAIT_T2 -.->|7×24循环| DATA_UPDATE
+    
+    %% Legend
+    subgraph 图例
+        A[矩形=处理步骤] --> B{菱形=判断分支}
+        C[六边形=结果] --> D[/平行四边形=输入输出/]
+    end
+```
+
+---
+
+## 核心循环时序
+
+```mermaid
+sequenceDiagram
+    participant Sched as Scheduler
+    participant Miner as FactorMiner
+    participant Eval as FactorEval
+    participant Pool as FactorPool
+    participant Gen as StrategyGen
+    participant Opt as Optimizer
+    participant BT as Backtester
+    participant Perf as Performance
+    participant DB as DuckDB
+    participant Alert as Alerter
+
+    Note over Sched: 7×24 全天候运转
+
+    Sched->>Miner: 01:00 触发
+    Miner->>DB: 读取原始数据
+    DB-->>Miner: 价量/财务/北向
+    Miner->>Miner: 挖掘100个候选因子
+    Miner->>Eval: 提交候选
+
+    Sched->>Eval: 03:00 触发
+    Eval->>DB: 读取历史数据
+    Eval->>Eval: IC/IR分析
+    Eval->>Eval: 分组回测
+    Eval->>Eval: 衰减测试
+    Eval-->>Pool: 评估结果
+
+    Sched->>Pool: 18:00 触发
+    Pool->>Pool: 排名更新
+    Pool->>Pool: 淘汰 IR<0.3
+    Pool->>Pool: 晋升 IR>1.0
+
+    Sched->>Gen: 05:00 触发
+    Gen->>Pool: 读取Top因子
+    Gen->>Gen: 生成策略模板
+    Gen->>Opt: 提交优化任务
+    Opt->>BT: 批量回测
+    BT-->>Opt: 回测结果
+    Opt-->>Gen: 最优参数
+
+    Sched->>BT: 07:00 触发
+    BT->>DB: 加载3200只主板股
+    loop 每日回测
+        BT->>BT: 信号→风控→成交
+        BT->>DB: 记录交易
+    end
+    BT-->>Perf: 交易明细
+    Perf->>Perf: 计算绩效
+    Perf->>DB: 存储结果
+
+    Sched->>Perf: 15:30 触发
+    Perf->>Perf: 生成HTML报告
+    Perf-->>Alert: 发送日报
+
+    Alert->>Alert: 监控异常
+    Alert->>Alert: 飞书通知
+```

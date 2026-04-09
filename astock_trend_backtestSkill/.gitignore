@@ -1,0 +1,21 @@
+# 运行时数据（不提交）
+checkpoints/
+data/
+logs/
+output/
+reports/
+~/
+.pytest_cache/
+*.duckdb
+*.jsonl
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db

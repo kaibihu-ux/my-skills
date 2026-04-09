@@ -1,0 +1,140 @@
+stock_pool:
+  include_codes: ['600', '601', '603', '000', '001']
+  exclude_codes: ['688', '300', '8', '200']
+  exclude_st: true
+  exclude_new_stock_days: 60
+  min_daily_amount: 10000000
+
+backtest:
+  start_date: "20240101"
+  end_date: "20231231"
+  initial_cash: 10000000
+  commission: 0.0003
+  slippage: 0.001
+  benchmark: "000300.SH"
+
+factor_mining:
+  candidates_per_round: 100
+  min_ic_threshold: 0.02
+  min_ir_threshold: 0.3
+
+factor_pool:
+  max_size: 100
+  promotion_threshold_ir: 1.0
+  demotion_threshold_ir: 0.3
+  eviction_threshold_ic: 0.02
+  eviction_threshold_ir: 0.3
+
+strategy:
+  holding_periods: [5, 10, 20, 60]
+  weight_schemes: ['equal', 'ic_weighted', 'volatility_inverse']
+  stop_loss: [0.05, 0.10, 0.15]
+  take_profit: [0.10, 0.20, 0.30]
+  rebalance_frequency: ['daily', 'weekly', 'monthly']
+  max_position_per_stock: 0.2
+  max_total_position: 1.0
+
+scheduler:
+  data_update: "00:00"
+  factor_mining: "01:00"
+  factor_eval: "03:00"
+  strategy_gen: "05:00"
+  backtest: "07:00"
+  report: "15:30"
+  pool_rebalance: "18:00"
+
+# 过拟合检测配置
+overfit_detection:
+  enabled: true
+  pbo_threshold: 0.5        # PBO < 0.5 才接受（越低越好）
+  dsr_threshold: 0.0       # DSR > 0 才接受（考虑运气调整后仍显著）
+  cscv_threshold: 0.5       # CSCV > 0.5 才接受（越接近1越好）
+  n_splits_cscv: 4          # CSCV 分割数
+  oos_ratio: 0.2            # 样本外数据比例（最后20%）
+
+# 多重检验偏误矫正配置
+multiple_testing:
+  method: 'bh'              # bonferroni / bh（FDR控制）
+  fdr_rate: 0.05            # 显著性水平
+
+# ============================================================
+# 新增：高级功能配置
+# ============================================================
+
+# 分组单调性回测配置
+monotonicity:
+  enabled: true
+  n_groups: 5              # 分组数（Top/Middle/Bottom 等）
+  min_monotonicity: 0.6    # 单调性得分低于此值则弃用因子
+  future_period: 20        # 未来持仓天数
+  frequency: 'monthly'     # 'monthly' 或 'weekly'
+
+# 因子中性化配置
+neutralization:
+  enabled: true
+  winsorize_pct: 0.01      # 极值截断比例（上下1%）
+  methods:                 # 中性化方法，可选：industry / market_cap
+    - industry
+    - market_cap
+
+# 机器学习模型配置
+ml_models:
+  xgboost:
+    enabled: true
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.05
+    colsample_bytree: 0.8
+    subsample: 0.8
+    label_horizon: 5       # 预测未来5日涨跌
+    future_period: 5
+  lstm:
+    enabled: false         # 需要 pip install torch
+    seq_len: 20            # 历史序列长度
+    hidden_size: 64
+    num_layers: 2
+    epochs: 50
+    learning_rate: 0.001
+  transformer:
+    enabled: false         # 需要 pip install torch
+    d_model: 64
+    nhead: 4
+    num_layers: 2
+    epochs: 50
+    learning_rate: 0.001
+
+# 绩效归因配置
+attribution:
+  enabled: true
+  factors:                # Barra 风格因子
+    - market_cap
+    - book_to_price
+    - earnings_growth
+    - momentum
+    - volatility
+    - profitability
+    - quality
+    - liquidity
+
+# 压力测试配置
+stress_test:
+  enabled: true
+  historical_periods:
+    - name: '股灾1.0'
+      start: '2015-06-01'
+      end: '2015-09-30'
+    - name: '熔断'
+      start: '2016-01-01'
+      end: '2016-02-29'
+    - name: '贸易战'
+      start: '2018-02-01'
+      end: '2018-12-31'
+    - name: 'COVID'
+      start: '2020-02-01'
+      end: '2020-03-31'
+    - name: '熊市'
+      start: '2022-03-01'
+      end: '2022-10-31'
+  param_robustness_trials: 20    # 参数扰动试验次数
+  param_perturb_range: 0.20      # 参数扰动范围 ±20%
+  oos_ratio: 0.2                  # 样本外数据比例
