@@ -1,0 +1,8 @@
+{
+  "name": "astock_factor_forge",
+  "version": "1.0.0",
+  "description": "A股趋势投资量化因子工厂 - 7×24小时全自动因子挖掘与策略优化",
+  "runtime": "python",
+  "entry": "src/api/skill_api.py",
+  "dependencies": ["pandas", "numpy", "duckdb", "talib", "optuna", "lightgbm"]
+}

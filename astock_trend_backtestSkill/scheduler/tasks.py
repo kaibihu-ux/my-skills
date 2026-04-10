@@ -1221,26 +1221,27 @@ def start_scheduler():
         print("  07:00 — 因子池更新")
         print("  08:00 — 盘前策略预判")
         print("  09:30 — 盘中监控（后台线程）")
-        print("  18:00 — 盘后数据更新")
-        print("  18:30 — 因子重平衡（等数据确认）")
-        print("  19:00 — Step1: LightGBM因子筛选")
-        print("  20:00 — Step2: GA遗传算法优化")
-        print("  21:00 — Step3: RL强化学习仓位优化")
-        print("  22:00 — Step4: Bayesian参数精调")
-        print("  23:00 — Step5: 最终回测+生成报告")
-        print("  23:30 — 发送策略报告")
+        print("  15:30 — 盘后数据更新")
+        print("  16:00 — 因子重平衡")
+        print("  16:30 — 因子池更新")
+        print("  17:00 — Step1: LightGBM因子筛选")
+        print("  18:00 — Step2: GA遗传算法优化")
+        print("  20:00 — Step3: RL强化学习仓位优化")
+        print("  21:00 — Step4: Bayesian参数精调")
+        print("  22:00 — Step5: 最终回测+生成报告")
+        print("  23:00 — 发送策略报告")
 
-        scheduler.add_job(job_factor_pool_update, CronTrigger(hour=7, minute=0))
         scheduler.add_job(job_pre_market, CronTrigger(hour=8, minute=0))
         scheduler.add_job(job_market_watcher, CronTrigger(hour=9, minute=30))
-        scheduler.add_job(job_post_market, CronTrigger(hour=18, minute=0))
-        scheduler.add_job(job_factor_rebalance, CronTrigger(hour=18, minute=30))
-        scheduler.add_job(job_step1_lgb, CronTrigger(hour=19, minute=0))       # 19:00 LightGBM因子筛选
-        scheduler.add_job(job_step2_ga, CronTrigger(hour=20, minute=0))         # 20:00 GA优化
-        scheduler.add_job(job_step3_rl, CronTrigger(hour=21, minute=0))          # 21:00 RL仓位优化
-        scheduler.add_job(job_step4_bayes, CronTrigger(hour=22, minute=0))      # 22:00 Bayesian精调
-        scheduler.add_job(job_step5_final, CronTrigger(hour=23, minute=0))     # 23:00 最终回测+报告
-        scheduler.add_job(job_send_strategy_report, CronTrigger(hour=23, minute=30))  # 23:30 发送报告
+        scheduler.add_job(job_post_market, CronTrigger(hour=15, minute=30))
+        scheduler.add_job(job_factor_rebalance, CronTrigger(hour=16, minute=0))
+        scheduler.add_job(job_factor_pool_update, CronTrigger(hour=16, minute=30))   # 因子池更新（16:30）
+        scheduler.add_job(job_step1_lgb, CronTrigger(hour=17, minute=0))       # 17:00 LightGBM因子筛选
+        scheduler.add_job(job_step2_ga, CronTrigger(hour=18, minute=0))        # 18:00 GA优化
+        scheduler.add_job(job_step3_rl, CronTrigger(hour=20, minute=0))         # 20:00 RL仓位优化
+        scheduler.add_job(job_step4_bayes, CronTrigger(hour=21, minute=0))      # 21:00 Bayesian精调
+        scheduler.add_job(job_step5_final, CronTrigger(hour=22, minute=0))      # 22:00 最终回测+报告
+        scheduler.add_job(job_send_strategy_report, CronTrigger(hour=23, minute=0))  # 23:00 发送报告
 
     else:
         # ==================== 非交易日任务（分拆版）====================
