@@ -514,6 +514,17 @@ class DataManager:
         for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
             os.environ.pop(k, None)
 
+        # force=True 时：先探查一只股票，确认数据已发布再删旧数据
+        if force:
+            probe_code = self.store.df(
+                f"SELECT ts_code FROM stock_daily WHERE trade_date = '{trade_date}' LIMIT 1"
+            )
+            if not probe_code.empty:
+                test_df = _fetch_with_fallback(probe_code.iloc[0]['ts_code'], trade_date)
+                if test_df is None or test_df.empty:
+                    self.logger.warning(f"今日数据未发布（{trade_date}），跳过强制刷新，保留现有数据")
+                    return 0
+
         # 用 baostock.query_all_stock 获取该日期主板股票
         self._session_codes = _get_bs_all_stock_codes(trade_date)
         self.logger.info(f"baostock基准: {len(self._session_codes)} 只")
