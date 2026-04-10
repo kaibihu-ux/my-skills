@@ -116,13 +116,16 @@ class MarketWatcher:
         today_fmt = date.today().strftime("%Y-%m-%d")
 
         try:
-            # ===== 先更新当日实时数据（无视DB已有数据，全部重新抓） =====
+            # ===== 先更新当日实时数据（限时5分钟，防baostock未发布数据时卡住） =====
             self._ensure_api()
             try:
-                self.api.data_mgr.update_daily(today_str, today_str)
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as CFTimeoutError
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.api.data_mgr.update_daily, today_str, today_str)
+                    future.result(timeout=300)  # 最多等5分钟
                 print(f"[{now_str}] MarketWatcher: 当日数据已更新")
-            except Exception as e:
-                print(f"[{now_str}] MarketWatcher: 数据更新失败（{e}），继续使用库内数据")
+            except (CFTimeoutError, Exception) as e:
+                print(f"[{now_str}] MarketWatcher: 数据更新超时/失败（{e}），继续使用库内数据")
 
             # 从回测引擎获取当前模拟持仓
             # 读取最新保存的持仓信号
