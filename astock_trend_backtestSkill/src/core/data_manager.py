@@ -191,6 +191,124 @@ def _curl_sina(ts_code: str, trade_date: str) -> Optional[pd.DataFrame]:
         pass
     return None
 
+
+def _fetch_realtime_sina(ts_code: str, trade_date: str) -> Optional[pd.DataFrame]:
+    """新浪实时行情接口，支持复权调整与数据清洗。
+
+    返回 df（含 ts_code/trade_date/open/high/low/close/vol/amount/pre_close）或 None。
+
+    复权逻辑：利用新浪 prev_close（前收盘）和数据库里的前收盘计算调整因子，
+    将实时未调整价格转换为与数据库一致的前复权价格。
+    """
+    try:
+        ts = _ts_to_sina(ts_code)
+        if ts is None:
+            return None
+        url = f"http://hq.sinajs.cn/list={ts}"
+        out = subprocess.run(
+            ['curl', '-s', '--max-time', '8', url,
+             '-H', 'Referer: http://finance.sina.com.cn',
+             '-H', 'Accept: */*'],
+            capture_output=True, timeout=10
+        )
+        if out.returncode != 0 or not out.stdout:
+            return None
+
+        raw = out.stdout.decode('gbk', errors='replace').strip()
+        if 'hq_str' not in raw or '=' not in raw:
+            return None
+
+        val = raw.split('="')[1].rstrip('";').strip()
+        fields = val.split(',')
+        if len(fields) < 35:
+            return None
+
+        # 字段解析（参考新浪格式）
+        # 0: name, 1: open, 2: prev_close, 3: current, 4: high, 5: low,
+        # 8: vol(shares), 9: amount, 29: time, 30: status
+        name       = fields[0]
+        open_px    = float(fields[1]) if fields[1] else 0.0
+        prev_close = float(fields[2]) if fields[2] else 0.0
+        close_px   = float(fields[3]) if fields[3] else 0.0
+        high_px    = float(fields[4]) if fields[4] else 0.0
+        low_px     = float(fields[5]) if fields[5] else 0.0
+        vol        = float(fields[8]) if fields[8] else 0.0
+        amount     = float(fields[9]) if fields[9] else 0.0
+        time_str   = fields[29] if len(fields) > 29 else ''
+        date_str   = fields[30] if len(fields) > 30 else ''
+        status     = fields[32] if len(fields) > 32 else ''
+
+        # 数据清洗
+        # 停牌：成交量为0
+        if vol == 0 or close_px == 0:
+            return None
+        # 过滤涨跌停外异常价格（涨跌幅>20%视为异常）
+        if prev_close > 0:
+            change_pct = abs((close_px - prev_close) / prev_close)
+            if change_pct > 0.23:  # 超过±23%视为异常
+                return None
+        # 合规价格范围（防止小数点错误等）
+        if not (0.01 < close_px < 100000):
+            return None
+        # 若未提供日期，用接口返回的
+        if date_str and len(date_str) == 10:
+            trade_date_fmt = date_str
+        else:
+            trade_date_fmt = trade_date
+
+        return pd.DataFrame([{
+            'ts_code': ts_code,
+            'trade_date': trade_date_fmt,
+            'open': open_px,
+            'high': high_px,
+            'low': low_px,
+            'close': close_px,
+            'pre_close': prev_close,
+            'vol': vol,
+            'amount': amount,
+            'status': status,
+            '_time': time_str,
+            '_name': name,
+        }])
+
+    except Exception:
+        return None
+
+
+def _apply_adjustment(df: pd.DataFrame, ts_code: str, trade_date: str,
+                       store) -> pd.DataFrame:
+    """对实时行情 DataFrame 应用复权因子，转换为前复权价格。
+
+    复权因子 = 数据库中该股票昨日收盘价 / 新浪 prev_close
+    """
+    if df is None or df.empty:
+        return df
+
+    sina_prev_close = df.iloc[0]['pre_close']
+    if sina_prev_close <= 0:
+        return df  # 无法计算，返回未调整数据
+
+    # 查数据库中该股昨日收盘价（前复权基准）
+    prev_date_q = store.conn.execute(
+        f"SELECT close FROM stock_daily "
+        f"WHERE ts_code = '{ts_code}' "
+        f"AND trade_date < '{trade_date}' "
+        f"ORDER BY trade_date DESC LIMIT 1"
+    ).fetchone()
+
+    if prev_date_q is None or prev_date_q[0] is None or prev_date_q[0] <= 0:
+        return df  # 数据库无基准，不调整
+
+    db_prev_close = float(prev_date_q[0])
+    factor = db_prev_close / sina_prev_close
+
+    # 价格调整：乘以因子
+    for col in ['open', 'high', 'low', 'close', 'pre_close']:
+        df[col] = df[col] * factor
+
+    return df
+
+
 def _fetch_akshare(ts_code: str, trade_date: str) -> Optional[pd.DataFrame]:
     """akshare 日K线，返回 df 或 None"""
     try:
@@ -468,9 +586,17 @@ class DataManager:
         start_fmt = self._normalize_date(start_date)
         end_fmt = self._normalize_date(end_date)
 
-        if start_fmt == end_fmt and not force:
-            # 单日：使用 curl 并行（更快）
-            return self._update_daily_curl(start_fmt, max_workers=max_workers)
+        if start_fmt == end_fmt:
+            # 单日更新
+            from datetime import date
+            today_fmt = date.today().strftime('%Y-%m-%d')
+            if force and start_fmt == today_fmt:
+                # 强制更新今日数据：优先用新浪实时接口（立即可用）
+                return self._update_daily_curl(start_fmt, max_workers=max_workers, force=True)
+            elif not force:
+                # 非强制：使用 curl 并行（更快）
+                return self._update_daily_curl(start_fmt, max_workers=max_workers)
+            # force=True 但非今日：走下方 baostock 多日路径
 
         # 多日：使用 baostock 并行
         self.logger.info(f"更新日线数据 {start_fmt} ~ {end_fmt}... (并行 workers={max_workers})")
@@ -520,10 +646,14 @@ class DataManager:
                 f"SELECT ts_code FROM stock_daily WHERE trade_date = '{trade_date}' LIMIT 1"
             )
             if not probe_code.empty:
-                test_df = _fetch_with_fallback(probe_code.iloc[0]['ts_code'], trade_date)
+                # 优先用新浪实时行情探查（盘中/盘后立即可用）
+                test_df = _fetch_realtime_sina(probe_code.iloc[0]['ts_code'], trade_date)
                 if test_df is None or test_df.empty:
-                    self.logger.warning(f"今日数据未发布（{trade_date}），跳过强制刷新，保留现有数据")
-                    return 0
+                    # 实时接口无数据，尝试历史K线（五链路）
+                    test_df = _fetch_with_fallback(probe_code.iloc[0]['ts_code'], trade_date)
+                    if test_df is None or test_df.empty:
+                        self.logger.warning(f"今日数据未发布（{trade_date}），跳过强制刷新，保留现有数据")
+                        return 0
 
         # 用 baostock.query_all_stock 获取该日期主板股票
         self._session_codes = _get_bs_all_stock_codes(trade_date)
