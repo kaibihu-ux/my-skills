@@ -1296,6 +1296,9 @@ if __name__ == '__main__':
             'factor_rebalance_and_report': job_factor_rebalance_and_report,
             'step1_lgb': job_step1_lgb,
             'step2_ga': job_step2_ga,
+            'step3_rl': job_step3_rl,
+            'step4_bayes': job_step4_bayes,
+            'step5_final': job_step5_final,
             'send_strategy_report': job_send_strategy_report,
         }
 
