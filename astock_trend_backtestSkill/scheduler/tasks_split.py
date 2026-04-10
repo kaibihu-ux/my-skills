@@ -988,6 +988,34 @@ def job_step5_final(force_restart=False):
         logger.warning(f"最终回测失败: {e}")
         final_bt = {}
 
+    # ===== 持仓写入 backtest_positions =====
+    if final_bt and final_bt.get('trades'):
+        print(f"[{now}] Step5.x: 写入持仓到 backtest_positions...")
+        try:
+            from collections import defaultdict
+            # 从交易记录重建期末持仓
+            shares_held = defaultdict(int)
+            for trade in final_bt['trades']:
+                if trade.get('direction') == 'buy':
+                    shares_held[trade['ts_code']] += int(trade.get('quantity', 0))
+                elif trade.get('direction') == 'sell':
+                    shares_held[trade['ts_code']] -= int(trade.get('quantity', 0))
+            # 过滤掉期末已清仓的
+            final_positions = {code: qty for code, qty in shares_held.items() if qty > 0}
+            total_shares = sum(final_positions.values()) or 1
+
+            # 写入 backtest_positions（先删除旧记录再插入）
+            store.conn.execute("DELETE FROM backtest_positions")
+            for code, qty in final_positions.items():
+                ratio = qty / total_shares
+                store.conn.execute(
+                    "INSERT INTO backtest_positions (date, code, position_ratio, updated_at) VALUES (?, ?, ?, ?)",
+                    [end_date, code, ratio, datetime.now()]
+                )
+            print(f"[{now}] 持仓写入完成: {len(final_positions)} 只股票")
+        except Exception as e:
+            logger.warning(f"持仓写入失败: {e}")
+
     # 过拟合检测
     print(f"[{now}] Step5.2: 过拟合检测...")
     overfit_accepted = True

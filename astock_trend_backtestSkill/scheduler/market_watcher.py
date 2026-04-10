@@ -113,8 +113,17 @@ class MarketWatcher:
         """检查持仓股票行情"""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         today_str = date.today().strftime("%Y%m%d")
+        today_fmt = date.today().strftime("%Y-%m-%d")
 
         try:
+            # ===== 先更新当日实时数据（无视DB已有数据，全部重新抓） =====
+            self._ensure_api()
+            try:
+                self.api.data_mgr.update_daily(today_str, today_str)
+                print(f"[{now_str}] MarketWatcher: 当日数据已更新")
+            except Exception as e:
+                print(f"[{now_str}] MarketWatcher: 数据更新失败（{e}），继续使用库内数据")
+
             # 从回测引擎获取当前模拟持仓
             # 读取最新保存的持仓信号
             positions = self._get_current_positions(today_str)
@@ -139,7 +148,7 @@ class MarketWatcher:
                         continue
 
                     close = float(quote_df.iloc[0]['close'])
-                    pre_close = float(quote_df.iloc[0]['close']) / (1 + float(quote_df.iloc[0]['change_pct'])) if float(quote_df.iloc[0]['change_pct']) != 0 else float(quote_df.iloc[0]['close'])
+                    pre_close = float(quote_df.iloc[0]['pre_close'])
                     change_pct = float(quote_df.iloc[0]['change_pct'])
 
                     if abs(change_pct) >= self.single_stock_threshold:

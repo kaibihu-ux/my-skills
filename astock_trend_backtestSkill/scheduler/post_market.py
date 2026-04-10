@@ -51,6 +51,29 @@ def post_market():
         except Exception as e:
             print(f"[{now}] 数据下载失败（可能非交易日或数据未更新）: {e}")
 
+        # ===== 1.5 数据新鲜度检查 =====
+        try:
+            latest_factor_date = store.conn.execute(
+                "SELECT MAX(trade_date) FROM factors"
+            ).fetchone()[0]
+            if latest_factor_date:
+                # 计算距离今天有多少个交易日
+                td_count = store.conn.execute(
+                    f"SELECT COUNT(*) FROM stock_daily WHERE trade_date > '{latest_factor_date}' AND trade_date <= '{today_fmt}'"
+                ).fetchone()[0]
+                if td_count >= 2:
+                    alert_msg = f"⚠️ 因子数据陈旧！最新因子日期: {latest_factor_date}，已间隔 {td_count} 个交易日未更新"
+                    print(f"[{now}] {alert_msg}")
+                    # 写入 alerts 表供盘后报告记录
+                    store.conn.execute(
+                        "INSERT INTO alerts (alert_type, message, created_at) VALUES (?, ?, ?)",
+                        ['DATA_FRESHNESS', alert_msg, datetime.now()]
+                    )
+                else:
+                    print(f"[{now}] 因子数据新鲜度正常（最新: {latest_factor_date}，间隔{td_count}个交易日）")
+        except Exception as e:
+            print(f"[{now}] 数据新鲜度检查失败: {e}")
+
         # ===== 2. 今日行情快照 =====
         market_summary = _get_market_snapshot(store, today_fmt)
 
