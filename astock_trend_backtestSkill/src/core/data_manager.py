@@ -454,11 +454,13 @@ class DataManager:
         except Exception:
             return None
 
-    def update_daily(self, start_date: str, end_date: str, max_workers: int = 8, sync_stock_list: bool = True) -> int:
+    def update_daily(self, start_date: str, end_date: str, max_workers: int = 8, sync_stock_list: bool = True, force: bool = False) -> int:
         """更新日线数据（多进程并行获取，每个进程独立连接）
 
         注意：区间更新（start_date != end_date）使用 baostock 多日模式；
         单日增量更新请使用 update_daily_incremental()。
+
+        force=True 时强制全量重新拉取（跳过"已有数据"检查），用于盘后确保收盘价。
 
         股票来源：baostock.query_all_stock()（主板，过滤600/601/603+000/001）
         """
@@ -466,7 +468,7 @@ class DataManager:
         start_fmt = self._normalize_date(start_date)
         end_fmt = self._normalize_date(end_date)
 
-        if start_fmt == end_fmt:
+        if start_fmt == end_fmt and not force:
             # 单日：使用 curl 并行（更快）
             return self._update_daily_curl(start_fmt, max_workers=max_workers)
 
@@ -504,7 +506,7 @@ class DataManager:
         self.logger.info(f"日线更新完成，成功: {success_count}/{total} 只股票")
         return success_count
 
-    def _update_daily_curl(self, trade_date: str, max_workers: int = 8) -> int:
+    def _update_daily_curl(self, trade_date: str, max_workers: int = 8, force: bool = False) -> int:
         """单日增量更新：bs.query_all_stock基准 + 五链路curl备援 + 进程并行"""
         self.logger.info(f"单日增量更新 {trade_date} (bs基准, 五链路备援, workers={max_workers})")
 
@@ -521,11 +523,14 @@ class DataManager:
             stocks_df = self.store.df("SELECT ts_code FROM stock_list")
             self._session_codes = stocks_df['ts_code'].tolist()
 
-        # 排除已有数据
-        existing = set(self.store.df(
-            f"SELECT ts_code FROM stock_daily WHERE trade_date = '{trade_date}'"
-        )['ts_code'].tolist())
-        to_fetch = [c for c in self._session_codes if c not in existing]
+        # 排除已有数据（force=True 时跳过，强制全量拉取确保收盘价）
+        if force:
+            to_fetch = list(self._session_codes)
+        else:
+            existing = set(self.store.df(
+                f"SELECT ts_code FROM stock_daily WHERE trade_date = '{trade_date}'"
+            )['ts_code'].tolist())
+            to_fetch = [c for c in self._session_codes if c not in existing]
         total = len(to_fetch)
         self.logger.info(f"baostock基准: {len(self._session_codes)}, 已有: {len(existing)}, 待取: {total}")
 

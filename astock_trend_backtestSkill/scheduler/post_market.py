@@ -43,10 +43,11 @@ def post_market():
         store = api.store
         logger = api.logger
 
-        # ===== 1. 下载今日完整数据 =====
-        print(f"[{now}] 下载今日数据...")
+        # ===== 1. 下载今日完整数据（强制全量更新，确保收盘价） =====
+        print(f"[{now}] 下载今日数据（强制全量，确保收盘价）...")
         try:
-            api.data_mgr.update_daily(today_str, today_str)
+            # force=True：跳过"已有数据"检查，强制全量拉取，确保收盘价而非盘中实时价
+            api.data_mgr.update_daily(today_str, today_str, force=True)
             print(f"[{now}] 今日数据下载完成")
         except Exception as e:
             print(f"[{now}] 数据下载失败（可能非交易日或数据未更新）: {e}")
