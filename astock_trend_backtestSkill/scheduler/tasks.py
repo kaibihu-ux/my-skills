@@ -1294,6 +1294,8 @@ if __name__ == '__main__':
             'pre_market_analysis': job_pre_market,
             'post_market_review': job_post_market,
             'factor_rebalance_and_report': job_factor_rebalance_and_report,
+            'step1_lgb': job_step1_lgb,
+            'step2_ga': job_step2_ga,
             'send_strategy_report': job_send_strategy_report,
         }
 
