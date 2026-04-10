@@ -1222,8 +1222,8 @@ def start_scheduler():
         print("  08:00 — 盘前策略预判")
         print("  09:30 — 盘中监控（后台线程）")
         print("  15:30 — 盘后数据更新")
-        print("  16:00 — 因子重平衡")
-        print("  16:30 — 因子池更新")
+        print("  16:00 — 因子池更新（先评估）")
+        print("  16:30 — 因子重平衡（再重分配）")
         print("  17:00 — Step1: LightGBM因子筛选")
         print("  18:00 — Step2: GA遗传算法优化")
         print("  20:00 — Step3: RL强化学习仓位优化")
@@ -1234,8 +1234,8 @@ def start_scheduler():
         scheduler.add_job(job_pre_market, CronTrigger(hour=8, minute=0))
         scheduler.add_job(job_market_watcher, CronTrigger(hour=9, minute=30))
         scheduler.add_job(job_post_market, CronTrigger(hour=15, minute=30))
-        scheduler.add_job(job_factor_rebalance, CronTrigger(hour=16, minute=0))
-        scheduler.add_job(job_factor_pool_update, CronTrigger(hour=16, minute=30))   # 因子池更新（16:30）
+        scheduler.add_job(job_factor_pool_update, CronTrigger(hour=16, minute=0))   # 因子池更新（先评估）
+        scheduler.add_job(job_factor_rebalance, CronTrigger(hour=16, minute=30))   # 因子重平衡（再重分配）
         scheduler.add_job(job_step1_lgb, CronTrigger(hour=17, minute=0))       # 17:00 LightGBM因子筛选
         scheduler.add_job(job_step2_ga, CronTrigger(hour=18, minute=0))        # 18:00 GA优化
         scheduler.add_job(job_step3_rl, CronTrigger(hour=20, minute=0))         # 20:00 RL仓位优化
