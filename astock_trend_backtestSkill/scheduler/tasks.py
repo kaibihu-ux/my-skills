@@ -1324,8 +1324,8 @@ if __name__ == '__main__':
             print(f"可用非交易日任务: {list(NON_TRADING_TASKS.keys())}")
             sys.exit(1)
 
-        # 严格类型校验（step5_final 和 send_report 每天都会跑）
-        ALWAYS_RUN_TASKS = {'step5_final', 'send_report'}
+        # 严格类型校验（step1-step5 每天都跑，非交易日和交易日只是时间段不同）
+        ALWAYS_RUN_TASKS = {'step1_lgb', 'step2_ga', 'step3_rl', 'step4_bayes', 'step5_final', 'send_report'}
         if task_name not in ALWAYS_RUN_TASKS:
             if task_name in TRADING_TASKS:
                 if not is_td:
