@@ -260,6 +260,7 @@ def _update_job_optimize_checkpoint(step_name: str, data: Dict) -> None:
         'completed_step': step_name,
         'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'step_data': data,
+        'step_history': {step_name: data},
     }
     
     # 如果存在旧数据，合并而非覆盖
