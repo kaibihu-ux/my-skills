@@ -26,7 +26,8 @@ import json
 import functools
 import time
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from typing import Tuple, Optional, Dict, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -219,6 +220,220 @@ def is_step_done(target_step, current_step):
         return order.index(current_step) >= order.index(target_step)
     except ValueError:
         return False
+
+
+# =============================================================================
+# P0 Bug修复: job_optimize_checkpoint.json 同步更新 & 数据新鲜度校验
+# =============================================================================
+
+def _get_job_ckpt_path() -> Path:
+    """获取 job_optimize_checkpoint.json 路径"""
+    return Path(__file__).parent.parent / "checkpoints" / "job_optimize_checkpoint.json"
+
+
+def _get_job_optimize_checkpoint() -> Tuple[Optional[Dict], str]:
+    """
+    读取 job_optimize_checkpoint.json
+    返回 (data, completed_step)
+    """
+    ckpt_file = _get_job_ckpt_path()
+    if ckpt_file.exists():
+        try:
+            with open(ckpt_file, 'r') as f:
+                data = json.load(f)
+            return data, data.get('completed_step', '')
+        except Exception:
+            pass
+    return None, ''
+
+
+def _update_job_optimize_checkpoint(step_name: str, data: Dict) -> None:
+    """
+    同步更新 job_optimize_checkpoint.json
+    在各step完成后调用，确保主checkpoint与分步checkpoint同步
+    """
+    ckpt_file = _get_job_ckpt_path()
+    ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 构造更新数据
+    update_data = {
+        'completed_step': step_name,
+        'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'step_data': data,
+    }
+    
+    # 如果存在旧数据，合并而非覆盖
+    if ckpt_file.exists():
+        try:
+            with open(ckpt_file, 'r') as f:
+                old_data = json.load(f)
+            # 保留历史step数据
+            if 'step_history' not in old_data:
+                old_data['step_history'] = {}
+            old_data['step_history'][step_name] = data
+            old_data['completed_step'] = step_name
+            old_data['saved_at'] = update_data['saved_at']
+            update_data = old_data
+        except Exception:
+            pass
+    
+    # 原子写入
+    tmp = str(ckpt_file) + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(update_data, f, ensure_ascii=False, indent=2, default=str)
+    Path(tmp).rename(ckpt_file)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 💾 [FIX] job_optimize_checkpoint.json 已同步更新 → {step_name}")
+
+
+def _is_checkpoint_fresh(ckpt_data: Optional[Dict], step_name: str, force_restart: bool = False) -> Tuple[bool, str]:
+    """
+    P0: 检查checkpoint是否是当天的（非当天checkpoint不能跳过）
+    
+    返回 (is_fresh, reason)
+    - is_fresh=True 表示可以跳过
+    - is_fresh=False 表示不能跳过，需要重新运行
+    """
+    if force_restart:
+        return False, "force_restart=True"
+    
+    if ckpt_data is None:
+        return False, "checkpoint不存在"
+    
+    saved_at = ckpt_data.get('saved_at', '')
+    if not saved_at:
+        return False, "checkpoint无saved_at时间戳"
+    
+    try:
+        # 解析保存时间
+        saved_date_str = saved_at.split(' ')[0]  # 取 'YYYY-MM-DD' 部分
+        today_str = date.today().strftime('%Y-%m-%d')
+        
+        if saved_date_str != today_str:
+            return False, f"checkpoint是{saved_date_str}的，不是今天({today_str})，不能跳过"
+        
+        return True, "checkpoint是今天的，可以跳过"
+    except Exception as e:
+        return False, f"解析saved_at失败: {e}"
+
+
+def _check_and_skip_or_run(
+    step_name: str,
+    ckpt_data: Optional[Dict],
+    completed: str,
+    force_restart: bool = False,
+) -> Tuple[bool, Optional[Dict]]:
+    """
+    P0: 统一的checkpoint新鲜度检查+跳过判断
+    返回 (should_skip, data)
+    - should_skip=True 表示跳过（使用缓存数据）
+    - should_skip=False 表示需要运行
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 检查是否完成
+    if completed != step_name:
+        return False, None
+    
+    # 检查新鲜度
+    is_fresh, reason = _is_checkpoint_fresh(ckpt_data, step_name, force_restart)
+    
+    if is_fresh:
+        print(f"[{now_str}] ✅ {step_name} 已完成，从检查点恢复... ({reason})")
+        return True, ckpt_data
+    else:
+        print(f"[{now_str}] ⚠️  {step_name} checkpoint已存在但{reason}，将重新运行")
+        return False, None
+
+
+# =============================================================================
+# P1: 拆分监控/恢复checkpoint职责（可选增强）
+# =============================================================================
+
+class CheckpointMonitor:
+    """
+    P1: 独立的checkpoint监控器
+    负责：监控checkpoint健康状态、清理过期checkpoint、恢复指引
+    """
+    
+    def __init__(self, checkpoints_dir: Path):
+        self.checkpoints_dir = checkpoints_dir
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_all_checkpoints(self) -> Dict[str, Dict]:
+        """获取所有checkpoint及其状态"""
+        checkpoints = {}
+        for ckpt_file in self.checkpoints_dir.glob("weekend_*.json"):
+            try:
+                with open(ckpt_file, 'r') as f:
+                    data = json.load(f)
+                step = data.get('completed_step', ckpt_file.stem.replace('weekend_', ''))
+                checkpoints[step] = {
+                    'file': str(ckpt_file),
+                    'saved_at': data.get('saved_at', ''),
+                    'data': data,
+                }
+            except Exception:
+                pass
+        return checkpoints
+    
+    def get_progress(self) -> Tuple[int, int]:
+        """
+        获取当前进度
+        返回 (completed_steps, total_steps)
+        """
+        checkpoints = self.get_all_checkpoints()
+        order = ['step1_lgb', 'step2_ga', 'step3_rl', 'step4_bayes', 'step5_final']
+        completed = 0
+        for step in order:
+            if step in checkpoints:
+                data = checkpoints[step]['data']
+                if data.get('completed_step') == step:
+                    # 检查新鲜度
+                    saved_at = data.get('saved_at', '')
+                    if saved_at:
+                        saved_date = saved_at.split(' ')[0]
+                        today = date.today().strftime('%Y-%m-%d')
+                        if saved_date == today:
+                            completed += 1
+        return completed, len(order)
+    
+    def cleanup_stale(self, days: int = 7) -> int:
+        """清理指定天数之前的旧checkpoint"""
+        cleaned = 0
+        cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        
+        for ckpt_file in self.checkpoints_dir.glob("weekend_*.json"):
+            try:
+                with open(ckpt_file, 'r') as f:
+                    data = json.load(f)
+                saved_at = data.get('saved_at', '')
+                if saved_at:
+                    saved_date = saved_at.split(' ')[0]
+                    if saved_date < cutoff:
+                        ckpt_file.unlink()
+                        cleaned += 1
+            except Exception:
+                pass
+        
+        return cleaned
+    
+    def get_next_runnable_step(self) -> Optional[str]:
+        """获取下一个可执行的步骤"""
+        checkpoints = self.get_all_checkpoints()
+        order = ['step1_lgb', 'step2_ga', 'step3_rl', 'step4_bayes', 'step5_final']
+        
+        for step in order:
+            if step not in checkpoints:
+                return step
+            data = checkpoints[step]['data']
+            if data.get('completed_step') != step:
+                return step
+            # 检查新鲜度
+            is_fresh, _ = _is_checkpoint_fresh(data, step, force_restart=False)
+            if not is_fresh:
+                return step
+        
+        return None  # 全部完成
 
 
 # =============================================================================
@@ -433,12 +648,12 @@ def job_step1_lgb(force_restart=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] ===== Step1: LightGBM 因子筛选 =====")
 
-    # ---- 检查点续算 ----
+    # ---- P0 Bug修复: 检查点新鲜度校验 ----
     if not force_restart:
         ckpt_data, completed = get_ckpt('step1_lgb')
-        if completed == 'step1_lgb':
-            print(f"[{now}] ✅ Step1 已完成，从检查点恢复...")
-            return ckpt_data
+        should_skip, skip_data = _check_and_skip_or_run('step1_lgb', ckpt_data, completed, force_restart)
+        if should_skip:
+            return skip_data
 
     from src.core.ml_feature_selector import MLFeatureSelector
     from src.core.factor_eval import FactorEvaluator
@@ -524,12 +739,12 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
     # 注册 SIGTERM handler（捕获 cron kill 信号）
     _setup_sigterm_handler()
 
-    # ---- 检查点续算（仅 batch_id is None 时检查 step2_ga 完成状态）----
+    # ---- P0 Bug修复: 检查点新鲜度校验（仅 batch_id is None 时检查）----
     if batch_id is None and not force_restart:
         ckpt_data, completed = get_ckpt('step2_ga')
-        if completed == 'step2_ga':
-            print(f"[{now}] ✅ Step2 已完成，跳过")
-            return ckpt_data
+        should_skip, skip_data = _check_and_skip_or_run('step2_ga', ckpt_data, completed, force_restart)
+        if should_skip:
+            return skip_data
 
     # 必须有 Step1 结果
     ckpt1, comp1 = get_ckpt('step1_lgb')
@@ -732,11 +947,12 @@ def job_step3_rl(force_restart=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] ===== Step3: RL 强化学习仓位优化 =====")
 
+    # ---- P0 Bug修复: 检查点新鲜度校验 ----
     if not force_restart:
         ckpt_data, completed = get_ckpt('step3_rl')
-        if completed == 'step3_rl':
-            print(f"[{now}] ✅ Step3 已完成，从检查点恢复...")
-            return ckpt_data
+        should_skip, skip_data = _check_and_skip_or_run('step3_rl', ckpt_data, completed, force_restart)
+        if should_skip:
+            return skip_data
 
     ckpt2, comp2 = get_ckpt('step2_ga')
     if comp2 != 'step2_ga':
@@ -811,11 +1027,12 @@ def job_step4_bayes(force_restart=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] ===== Step4: Bayesian/Grid 参数精调 =====")
 
+    # ---- P0 Bug修复: 检查点新鲜度校验 ----
     if not force_restart:
         ckpt_data, completed = get_ckpt('step4_bayes')
-        if completed == 'step4_bayes':
-            print(f"[{now}] ✅ Step4 已完成，从检查点恢复...")
-            return ckpt_data
+        should_skip, skip_data = _check_and_skip_or_run('step4_bayes', ckpt_data, completed, force_restart)
+        if should_skip:
+            return skip_data
 
     ckpt3, comp3 = get_ckpt('step3_rl')
     if comp3 != 'step3_rl':
@@ -931,11 +1148,15 @@ def job_step5_final(force_restart=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{now}] ===== Step5: 最终回测 + 生成报告 =====")
 
+    # ---- P0 Bug修复: 检查点新鲜度校验 ----
     if not force_restart:
         ckpt_data, completed = get_ckpt('step5_final')
-        if completed == 'step5_final':
-            print(f"[{now}] ✅ Step5 已完成，报告已生成")
-            return ckpt_data
+        should_skip, skip_data = _check_and_skip_or_run('step5_final', ckpt_data, completed, force_restart)
+        if should_skip:
+            # P0: 即使跳过也要确保job_optimize_checkpoint是同步的
+            if skip_data:
+                _update_job_optimize_checkpoint('step5_final', skip_data)
+            return skip_data
 
     ckpt4, comp4 = get_ckpt('step4_bayes')
     if comp4 != 'step4_bayes':
@@ -1123,6 +1344,10 @@ def job_step5_final(force_restart=False):
     _print_summary(now, report)
 
     save_ckpt('step5_final', 'step5_final', report)
+    
+    # P0 Bug修复: step5完成后同步更新job_optimize_checkpoint.json
+    _update_job_optimize_checkpoint('step5_final', report)
+    
     print(f"[{now}] ✅ Step5 完成")
     _send_step_report("5", report)
     return report
