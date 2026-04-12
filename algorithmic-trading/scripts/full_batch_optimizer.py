@@ -359,7 +359,7 @@ def main():
     parser.add_argument('--no-resume', action='store_true', help='不复位继续')
     args = parser.parse_args()
 
-    db_path = os.path.expanduser('~/.openclaw/skills/algorithmic-trading/data/astock_full.duckdb')
+    db_path = os.path.expanduser('~/.openclaw/my-skills/algorithmic-trading/data/astock_full.duckdb')
 
     optimizer = FullBatchOptimizer(
         db_path=db_path,

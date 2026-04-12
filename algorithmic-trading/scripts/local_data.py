@@ -10,7 +10,7 @@ from typing import Optional, Union
 class LocalDataSource:
     """
     从本地DuckDB数据库读取A股数据
-    数据路径: ~/.openclaw/skills/algorithmic-trading/data/astock_full.duckdb
+    数据路径: ~/.openclaw/my-skills/algorithmic-trading/data/astock_full.duckdb
     """
 
     def __init__(self, db_path: str):
@@ -118,7 +118,7 @@ class PyBrokerLocalData:
 if __name__ == '__main__':
     # 测试代码
     import os
-    db_path = os.path.expanduser('~/.openclaw/skills/algorithmic-trading/data/astock_full.duckdb')
+    db_path = os.path.expanduser('~/.openclaw/my-skills/algorithmic-trading/data/astock_full.duckdb')
 
     if os.path.exists(db_path):
         ds = LocalDataSource(db_path)

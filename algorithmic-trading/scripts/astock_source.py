@@ -17,8 +17,8 @@ class AStockDataSource(DataSource):
         from scripts.astock_source import AStockDataSource
 
         data_source = AStockDataSource(
-            db_path='~/.openclaw/skills/algorithmic-trading/data/astock_full.duckdb'
-            # 或使用绝对路径: '/home/hyh/.openclaw/skills/algorithmic-trading/data/astock_full.duckdb'
+            db_path='~/.openclaw/my-skills/algorithmic-trading/data/astock_full.duckdb'
+            # 或使用绝对路径: '/home/hyh/.openclaw/my-skills/algorithmic-trading/data/astock_full.duckdb'
         )
         strategy = Strategy(data_source, start_date, end_date, config)
     """
