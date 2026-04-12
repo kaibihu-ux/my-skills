@@ -970,13 +970,28 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
 # =============================================================================
 
 @timeout(3 * 3600)
-def job_step3_rl(force_restart=False):
-    """非交易日 12:00 | Step3: RL 强化学习仓位优化"""
+def job_step3_rl(force_restart=False, batch_id=None, daily_reset=False):
+    """
+    Step3: RL 强化学习仓位优化（分批训练版）
+    
+    Args:
+        force_restart: 强制重新开始
+        batch_id: 批次 ID (0-3), None 表示不分批
+        daily_reset: 是否清除旧数据（仅 batch0 使用）
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{now}] ===== Step3: RL 强化学习仓位优化 =====")
+    if batch_id is not None:
+        print(f"\n[{now}] ===== Step3: RL 强化学习仓位优化 Batch {batch_id} =====")
+    else:
+        print(f"\n[{now}] ===== Step3: RL 强化学习仓位优化 =====")
 
     # ---- P0 Bug修复: 检查点新鲜度校验 ----
-    if not force_restart:
+    # batch0 逻辑
+    if batch_id == 0:
+        daily_reset = True
+
+    # ---- P0 Bug 修复：检查点新鲜度校验 ----
+    if not force_restart and batch_id is None:
         ckpt_data, completed = get_ckpt('step3_rl')
         should_skip, skip_data = _check_and_skip_or_run('step3_rl', ckpt_data, completed, force_restart)
         if should_skip:
@@ -1015,12 +1030,27 @@ def job_step3_rl(force_restart=False):
         gamma=0.95, alpha=0.1, epsilon=0.1,
         n_episodes=5, lookback_days=20,  # 原50
     )
-    rl_result = rl_opt.optimize(rl_strategy, ga_best_params, use_rl_position=True)
+    # 分批训练调用
+    if batch_id is not None:
+        rl_result = rl_opt.optimize(
+            rl_strategy, ga_best_params, 
+            use_rl_position=True,
+            batch_id=batch_id,
+            daily_reset=daily_reset
+        )
+        
+        # Eval 回测（每批后执行）
+        print(f"[{now}] Step3.2: Eval 回测...")
+        eval_result = rl_opt.run_eval_backtest()
+        rl_result['eval_results'].append(eval_result)
+        print(f"[{now}] Eval 回测：Sharpe={eval_result.get('sharpe', 0):.4f}")
+    else:
+        rl_result = rl_opt.optimize(rl_strategy, ga_best_params, use_rl_position=True)
     rl_best_sharpe = rl_result.get('final_sharpe', -999)
     print(f"[{now}] RL 最优: Sharpe={rl_best_sharpe:.4f}")
 
     # GA 过拟合检测
-    print(f"[{now}] Step3.2: GA 多重检验过拟合检测...")
+    print(f"[{now}] Step3.3: GA 多重检验过拟合检测...")
     try:
         ga_gen_history = ckpt2.get('ga_result', {}).get('generation_history', [])
         all_ga_sharpes = [h['best_sharpe'] for h in ga_gen_history]
@@ -1032,6 +1062,9 @@ def job_step3_rl(force_restart=False):
         mt_result = {}
 
     data = {
+        'rl_batch_id': rl_result.get('rl_batch_id', batch_id),
+        'rl_episodes_done': rl_result.get('rl_episodes_done', 5),
+        'eval_results': rl_result.get('eval_results', []),
         'rl_result': {k: v for k, v in rl_result.items() if k not in ('q_table',)},
         'rl_best_sharpe': rl_best_sharpe,
         'ga_best_factors': ga_best_factors,

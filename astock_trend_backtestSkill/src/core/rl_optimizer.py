@@ -295,6 +295,7 @@ class RLOptimizer:
         self._training_history: List = []
         self._current_episode: int = 0
         self._current_episode_epsilon: float = epsilon
+        self.eval_results: List = []
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -321,6 +322,8 @@ class RLOptimizer:
                 'training_history': self._training_history,
                 'current_episode': self._current_episode,
                 'current_epsilon': self._current_episode_epsilon,
+                'eval_results': self.eval_results,
+                'rl_batch_id': getattr(self, '_batch_id', 0),
             }
             tmp = str(self._checkpoint_path) + '.tmp'
             self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,6 +332,143 @@ class RLOptimizer:
             Path(tmp).rename(self._checkpoint_path)
             if force:
                 self.logger.info(f"[RL] 检查点已保存: {self._checkpoint_path}")
+
+
+    def load_checkpoint(self):
+        """加载检查点续训"""
+        if self._checkpoint_path is None:
+            try:
+                ckpt_dir = Path(__file__).parent.parent / "checkpoints"
+                self._checkpoint_path = ckpt_dir / "rl_checkpoint.json"
+            except Exception:
+                return
+        
+        if not self._checkpoint_path.exists():
+            self.logger.warning(f"[RL] 检查点不存在：{self._checkpoint_path}")
+            return
+        
+        try:
+            with open(self._checkpoint_path, 'r') as f:
+                ckpt = json.load(f)
+            
+            # 恢复 Q 表（字符串 key 转 tuple）
+            q_table_str = ckpt.get('q_table', {})
+            for k, v in q_table_str.items():
+                if isinstance(k, str):
+                    key_tuple = tuple(int(x) for x in k.split(','))
+                else:
+                    key_tuple = k
+                self.q_table[key_tuple] = v
+            
+            # 恢复训练历史
+            self._training_history = ckpt.get('training_history', [])
+            self._current_episode = ckpt.get('current_episode', 0)
+            self._current_episode_epsilon = ckpt.get('current_epsilon', self.epsilon)
+            self.eval_results = ckpt.get('eval_results', [])
+            
+            self.logger.info(f"[RL] 已加载检查点：episode={self._current_episode}")
+        except Exception as e:
+            self.logger.warning(f"[RL] 加载检查点失败：{e}")
+
+    def run_eval_backtest(self) -> Dict:
+        """
+        使用 Q-table 执行 Eval 回测
+        返回回测结果字典
+        """
+        self.logger.info("[RL] 开始 Eval 回测...")
+        
+        # 预加载 539 天数据到内存
+        data = self.load_all_data_to_memory()
+        
+        # 使用 Q-table 回测
+        result = self.backtest_with_qtable(data)
+        
+        self.eval_results.append(result)
+        self.logger.info(f"[RL] Eval 回测完成 | Sharpe={result.get('sharpe', 0):.4f}")
+        
+        return result
+
+    def load_all_data_to_memory(self) -> pd.DataFrame:
+        """预加载所有历史数据到内存 DataFrame"""
+        try:
+            df = self.backtester.store.df(
+                f"""SELECT trade_date, ts_code, close, volume, amount
+                    FROM stock_daily
+                    WHERE trade_date BETWEEN '{self.start_date}' AND '{self.end_date}'
+                    ORDER BY trade_date, ts_code"""
+            )
+            self.logger.info(f"[RL] 已加载 {len(df)} 条数据到内存")
+            return df
+        except Exception as e:
+            self.logger.warning(f"[RL] 加载数据失败：{e}")
+            return pd.DataFrame()
+
+    def backtest_with_qtable(self, data: pd.DataFrame) -> Dict:
+        """
+        使用训练好的 Q-table 执行回测
+        返回回测结果
+        """
+        if data.empty:
+            return {'sharpe': 0.0, 'total_return': 0.0, 'max_drawdown': 0.0}
+        
+        cash = self.backtester.initial_cash
+        positions = {}
+        nav_history = []
+        
+        trade_dates = sorted(data['trade_date'].unique())
+        
+        for date in trade_dates:
+            state = self._get_state(date, cash, positions, nav_history)
+            state_key = f"{state[0]},{state[1]},{state[2]}"
+            
+            # 使用 Q-table 决策
+            if state_key in self.q_table:
+                q_values = self.q_table[state_key]
+                action_idx = int(np.argmax(q_values))
+                position_ratio = self.ACTION_MAP[action_idx]
+            else:
+                position_ratio = 1.0  # 默认满仓
+            
+            # 执行交易
+            cash, positions = self._execute_with_position(
+                date=date,
+                strategy={'factors': []},
+                base_params={},
+                positions=positions,
+                cash=cash,
+                position_ratio=position_ratio,
+            )
+            
+            portfolio_value = cash + self._get_positions_value(date, positions)
+            nav_history.append(portfolio_value)
+        
+        # 计算指标
+        if len(nav_history) < 2:
+            return {'sharpe': 0.0, 'total_return': 0.0, 'max_drawdown': 0.0}
+        
+        nav_series = pd.Series(nav_history)
+        returns = nav_series.pct_change().dropna()
+        
+        total_return = (nav_history[-1] - nav_history[0]) / nav_history[0]
+        
+        risk_free = 0.03
+        if returns.std() > 0:
+            sharpe = (returns.mean() * 252 - risk_free) / (returns.std() * np.sqrt(252))
+        else:
+            sharpe = 0.0
+        
+        # 计算最大回撤
+        cummax = nav_series.cummax()
+        drawdown = (nav_series - cummax) / cummax
+        max_drawdown = float(drawdown.min())
+        
+        return {
+            'sharpe': float(sharpe),
+            'total_return': float(total_return),
+            'max_drawdown': max_drawdown,
+            'final_nav': float(nav_history[-1]),
+        }
+
 
     # ------------------------------------------------------------------
     # 核心方法
@@ -339,6 +479,8 @@ class RLOptimizer:
         strategy: Dict,
         base_params: Dict = None,
         use_rl_position: bool = True,
+        batch_id: int = 0,
+        daily_reset: bool = False,
     ) -> Dict:
         """
         训练 Q-Learning 策略，返回 Q 表和最优策略
@@ -354,18 +496,29 @@ class RLOptimizer:
                 'best_policy': {...},
                 'training_history': [{'episode': int, 'total_reward': float, 'epsilon': float}, ...],
                 'final_sharpe': float,
+                'rl_batch_id': int,
+                'rl_episodes_done': int,
+                'eval_results': [...],
             }
         """
+        # batch0 逻辑：清除旧数据或加载 checkpoint 续训
+        self._batch_id = batch_id
+        if batch_id == 0 or daily_reset:
+            self.logger.info(f"[RL] Batch {batch_id}: 清除旧数据，重新开始")
+            self.q_table = {}
+            self._training_history = []
+            self.eval_results = []
+        else:
+            self.logger.info(f"[RL] Batch {batch_id}: 加载 checkpoint 续训")
+            self.load_checkpoint()
+
         self.logger.info(
-            f"[RL] 开始训练 | Episodes={self.n_episodes}, gamma={self.gamma}, "
+            f"[RL] 开始训练 | Batch={batch_id}, Episodes={self.n_episodes}, gamma={self.gamma}, "
             f"alpha={self.alpha}, initial_epsilon={self.epsilon}"
         )
 
         # 1. 准备历史数据（获取市场状态序列）
         self._prepare_market_data()
-
-        # 2. 初始化 Q 表
-        self.q_table = defaultdict(lambda: [0.0, 0.0, 0.0])
 
         # 自动设置检查点路径
         if self._checkpoint_path is None:
@@ -376,7 +529,7 @@ class RLOptimizer:
             except Exception:
                 pass
 
-        training_history = []
+        training_history = self._training_history
         current_epsilon = self.epsilon
 
         # ---- 8进程并行执行 episodes ----
@@ -448,7 +601,7 @@ class RLOptimizer:
                 self.q_table[key_tuple] = v
 
         self._training_history = training_history
-        self._current_episode = self.n_episodes - 1
+        self._current_episode = (batch_id + 1) * self.n_episodes
         self._current_episode_epsilon = current_epsilon
 
         # 最终检查点
@@ -474,6 +627,9 @@ class RLOptimizer:
             'final_sharpe': float(final_sharpe),
             'n_states': len(self.q_table),
             'n_episodes': self.n_episodes,
+            'rl_batch_id': batch_id,
+            'rl_episodes_done': (batch_id + 1) * self.n_episodes,
+            'eval_results': self.eval_results,
         }
 
     # ------------------------------------------------------------------
