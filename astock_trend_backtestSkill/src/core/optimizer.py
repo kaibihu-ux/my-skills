@@ -69,7 +69,7 @@ class GridSearchOptimizer:
         if HAS_JOBLIB and len(all_combinations) > 4:
             n_workers = min(4, len(all_combinations))
             self.logger.info(f"[GridSearch] {len(all_combinations)} 种组合，workers={n_workers}")
-            results = joblib.Parallel(n_jobs=n_workers, prefer="processes", timeout=600)(
+            results = joblib.Parallel(n_jobs=n_workers, prefer="threads", timeout=600)(
                 joblib.delayed(_eval_combo)(combo) for combo in all_combinations
             )
             for combo, params, sharpe in results:
