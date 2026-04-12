@@ -81,6 +81,8 @@ def is_trading_day(d=None):
 
 # 共享停止标志（供 SIGTERM handler 和各任务检查）
 _stop_requested = False
+# 全局变量供 SIGTERM handler 使用（在 job_step2_ga 中设置）
+_current_ga_ckpt_path = None
 
 
 def _sigterm_handler(signum, frame):
@@ -90,7 +92,8 @@ def _sigterm_handler(signum, frame):
         return
     _stop_requested = True
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{now}] ⚠️  收到 SIGTERM，准备保存检查点并退出...")
+    print(f"\n[{now}] ⚠️  收到 SIGTERM | 时间戳: {time.time()} | pid={os.getpid()}")
+    print(f"[{now}]    检查点路径: {_current_ga_ckpt_path}")
     # 触发 save_ckpt → 写盘 → 然后 Python 进程可以干净退出
     import sys
     sys.exit(0)
@@ -733,11 +736,18 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
       None = 一次性跑完所有代数（用于手动触发测试）
       0-4  = 第 N 批，跑 GENS_PER_BATCH 代后保存检查点退出
     """
+    start_ts = time.time()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] 🚀 Step2-GA 批{batch_id} 开始 | pid={os.getpid()} | ppid={os.getppid()}")
+    print(f"[{now}]    开始时间戳: {start_ts}")
+    print(f"[{now}]    孤立会话检测: session={os.environ.get('SESSION', 'N/A')}")
+
     TOTAL_TARGET_GENS = generations if generations else (6 if trading_day else 6)   # 总代数
     GENS_PER_BATCH   = 3 if trading_day else 3    # 每批代数
 
     # 注册 SIGTERM handler（捕获 cron kill 信号）
+    global _current_ga_ckpt_path
+    _current_ga_ckpt_path = str(Path(__file__).parent.parent / 'checkpoints' / 'ga_checkpoint.json')
     _setup_sigterm_handler()
 
     # ---- P0 Bug修复: 检查点新鲜度校验（仅 batch_id is None 时检查）----
@@ -856,6 +866,7 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
     )
 
     # ---- 超时检查（SIGTERM 安全退出）----
+    last_logged_gen = [0]  # closure: track last logged generation
     cron_safe = CronSafeTimeout(
         cron_timeout_seconds=80 * 60,
         warning_pct=1.0,
@@ -863,6 +874,13 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
         step_name=f'Step2-GA-{batch_label}'
     )
     def _timeout_check():
+        # 每代完成后打印进度日志
+        current_gen = ga_opt._current_generation if hasattr(ga_opt, '_current_generation') else len(ga_opt._fitness_history)
+        if current_gen > last_logged_gen[0]:
+            elapsed = time.time() - start_ts
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{now_str}] 📊 GA Gen {current_gen} 完成 | 当前时间戳: {time.time()} | 运行: {elapsed:.0f}s")
+            last_logged_gen[0] = current_gen
         if cron_safe.check():
             print(f"[{now}] ⏰ 时间不多，保存检查点后退出")
             save_ckpt('step2_ga', 'step2_ga', {
@@ -878,6 +896,9 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
                 'neutralized_factors': neutralized_factors,
                 'xgb_result': {},
             })
+            n_completed = len(ga_opt._fitness_history)
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{now_str}] 💾 GA检查点已保存 | n_gens_completed={n_completed} | total_target={TOTAL_TARGET_GENS} | 时间戳: {time.time()}")
             return True
         return False
 
@@ -927,15 +948,21 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
     if n_total_now >= TOTAL_TARGET_GENS:
         # 全部完成
         save_ckpt('step2_ga', 'step2_ga', data)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] 💾 GA检查点已保存 | n_gens_completed={n_total_now} | total_target={TOTAL_TARGET_GENS} | 时间戳: {time.time()}")
         print(f"[{now}] ✅ Step2-GA 全部完成 ({TOTAL_TARGET_GENS}代)")
         _send_step_report("2", data)
     else:
         # 未完成，只保存中间结果（供下批接力）
         save_ckpt('step2_ga', 'step2_ga_partial', data)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] 💾 GA检查点已保存 | n_gens_completed={n_total_now} | total_target={TOTAL_TARGET_GENS} | 时间戳: {time.time()}")
         next_batch = batch_id + 1 if batch_id is not None else 1
         print(f"[{now}] ⏳ Step2-GA 批{batch_id} 完成({n_total_now}/{TOTAL_TARGET_GENS}代), "
               f"下批 batch{next_batch} 在下一 cron 触发")
 
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] ✅ Step2-GA 批{batch_id} 正常结束 | 总耗时: {time.time() - start_ts:.0f}s")
     return data
 
 
