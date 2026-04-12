@@ -47,8 +47,8 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
     ) = args
 
     # 在子进程中重建必要的数据库连接（避免 Store 对象不可 pickle）
-    import sqlite3
-    conn = sqlite3.connect(store_info, check_same_thread=False)
+    import duckdb
+    conn = duckdb.connect(store_info, read_only=True)
 
     class MiniStore:
         def __init__(self, conn):
@@ -314,8 +314,10 @@ class RLOptimizer:
         if self._checkpoint_path is None:
             return
         with self._checkpoint_lock:
+            # JSON不支持tuple key，转为字符串
+            q_table_str_keys = {str(k): v for k, v in self.q_table.items()}
             ckpt = {
-                'q_table': dict(self.q_table),
+                'q_table': q_table_str_keys,
                 'training_history': self._training_history,
                 'current_episode': self._current_episode,
                 'current_epsilon': self._current_episode_epsilon,
@@ -440,7 +442,10 @@ class RLOptimizer:
         # 用最优 episode 的 Q 表
         if best_q_table:
             for k, v in best_q_table.items():
-                key_tuple = tuple(int(x) for x in k.split(','))
+                if isinstance(k, str):
+                    key_tuple = tuple(int(x) for x in k.split(','))
+                else:
+                    key_tuple = k  # 已经是 tuple（从 checkpoint 恢复时）
                 self.q_table[key_tuple] = v
 
         self._training_history = training_history
