@@ -734,8 +734,8 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
       0-4  = 第 N 批，跑 GENS_PER_BATCH 代后保存检查点退出
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    TOTAL_TARGET_GENS = generations if generations else (3 if trading_day else 3)   # 总代数
-    GENS_PER_BATCH   = 1 if trading_day else 1    # 每批代数
+    TOTAL_TARGET_GENS = generations if generations else (6 if trading_day else 6)   # 总代数
+    GENS_PER_BATCH   = 3 if trading_day else 3    # 每批代数
 
     # 注册 SIGTERM handler（捕获 cron kill 信号）
     _setup_sigterm_handler()
