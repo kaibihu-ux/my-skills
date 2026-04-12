@@ -1275,6 +1275,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='A股量化因子工厂任务调度')
     parser.add_argument('--task', type=str, help='指定运行的任务类型')
+    parser.add_argument('--batch-id', type=int, default=None, help='分批ID，None表示连续跑完')
     args, unknown = parser.parse_known_args()
 
     if args.task:
@@ -1341,7 +1342,10 @@ if __name__ == '__main__':
         # 执行任务
         task_func = TRADING_TASKS.get(task_name) or NON_TRADING_TASKS.get(task_name)
         try:
-            task_func()
+            if task_name == 'step2_ga':
+                task_func(batch_id=args.batch_id)
+            else:
+                task_func()
         except Exception as e:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ 任务 [{task_name}] 执行失败: {e}")
             import traceback
