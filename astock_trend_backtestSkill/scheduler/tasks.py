@@ -1344,6 +1344,8 @@ if __name__ == '__main__':
         try:
             if task_name == 'step2_ga':
                 task_func(batch_id=args.batch_id)
+            elif task_name == 'step3_rl':
+                task_func(batch_id=args.batch_id, daily_reset=(args.batch_id == 0))
             else:
                 task_func()
         except Exception as e:
