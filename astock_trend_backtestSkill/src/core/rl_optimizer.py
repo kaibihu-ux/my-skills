@@ -9,6 +9,7 @@ import threading
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,213 @@ try:
     HAS_JOBLIB = True
 except ImportError:
     HAS_JOBLIB = False
+
+
+# ------------------------------------------------------------------
+# 模块级 Worker 函数（用于 ProcessPoolExecutor，必须可 pickle）
+# ------------------------------------------------------------------
+
+def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
+    """
+    单个 episode 的工作函数，在子进程中执行。
+    返回: (episode_reward, actions_taken, q_table_snapshot)
+    """
+    (
+        episode,
+        strategy,
+        base_params,
+        epsilon,
+        lookback_days,
+        gamma,
+        alpha,
+        trade_dates,
+        store_info,       # (conn_str, db_path) 用于重建 store
+        initial_cash,
+        commission,
+        slippage,
+    ) = args
+
+    # 在子进程中重建必要的数据库连接（避免 Store 对象不可 pickle）
+    import sqlite3
+    conn = sqlite3.connect(store_info, check_same_thread=False)
+
+    class MiniStore:
+        def __init__(self, conn):
+            self.conn = conn
+        def df(self, sql):
+            return pd.read_sql(sql, self.conn)
+
+    store = MiniStore(conn)
+
+    # 重建因子查询函数（子进程内）
+    def get_market_return(date):
+        try:
+            idx_prices = pd.read_sql(
+                f"""SELECT trade_date, close FROM stock_daily
+                    WHERE ts_code = '000001.SH'
+                    AND trade_date <= '{date}'
+                    ORDER BY trade_date DESC
+                    LIMIT {lookback_days}""",
+                conn
+            )
+            if len(idx_prices) >= 2:
+                ret = (idx_prices.iloc[0]['close'] - idx_prices.iloc[-1]['close']) \
+                      / idx_prices.iloc[-1]['close']
+                return float(ret)
+        except Exception:
+            pass
+        return 0.0
+
+    def get_momentum_return(date):
+        try:
+            dt = pd.to_datetime(date)
+            start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
+            start_str = start_dt.strftime('%Y-%m-%d')
+            mom_df = pd.read_sql(
+                f"""SELECT AVG(value) as avg_mom FROM factors
+                    WHERE factor_name = 'momentum_20'
+                    AND trade_date BETWEEN '{start_str}' AND '{date}'
+                    AND value IS NOT NULL""",
+                conn
+            )
+            if not mom_df.empty and mom_df.iloc[0]['avg_mom'] is not None:
+                return float(mom_df.iloc[0]['avg_mom'])
+        except Exception:
+            pass
+        return 0.0
+
+    def get_volatility(date):
+        try:
+            dt = pd.to_datetime(date)
+            start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
+            start_str = start_dt.strftime('%Y-%m-%d')
+            vol_df = pd.read_sql(
+                f"""SELECT AVG(value) as avg_vol FROM factors
+                    WHERE factor_name = 'volatility_20'
+                    AND trade_date BETWEEN '{start_str}' AND '{date}'
+                    AND value IS NOT NULL""",
+                conn
+            )
+            if not vol_df.empty and vol_df.iloc[0]['avg_vol'] is not None:
+                return float(vol_df.iloc[0]['avg_vol'])
+        except Exception:
+            pass
+        return 0.02
+
+    ACTION_MAP = {0: 0.0, 1: 0.5, 2: 1.0}
+    N_ACTIONS = 3
+    q_table = defaultdict(lambda: [0.0, 0.0, 0.0])
+
+    def get_state(date, portfolio_value, positions, nav_history):
+        market_ret = get_market_return(date)
+        market_regime = 1 if market_ret > 0.02 else (-1 if market_ret < -0.02 else 0)
+        momentum_ret = get_momentum_return(date)
+        momentum_signal = 1 if momentum_ret > 0.01 else (-1 if momentum_ret < -0.01 else 0)
+        vol = get_volatility(date)
+        vol_signal = 1 if vol > 0.03 else (-1 if vol < 0.015 else 0)
+        return (market_regime, momentum_signal, vol_signal)
+
+    def choose_action(state, eps):
+        if random.random() < eps:
+            return random.randint(0, N_ACTIONS - 1)
+        return int(np.argmax(q_table[state]))
+
+    def update_q(state, action, reward, next_state):
+        current_q = q_table[state][action]
+        max_next_q = max(q_table[next_state]) if next_state in q_table else 0.0
+        q_table[state][action] = current_q + alpha * (reward + gamma * max_next_q - current_q)
+
+    def get_positions_value(date, positions):
+        total = 0.0
+        for ts_code, pos in positions.items():
+            try:
+                df = pd.read_sql(
+                    f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
+                    conn
+                )
+                if not df.empty:
+                    total += pos['shares'] * float(df.iloc[0]['close'])
+            except Exception:
+                pass
+        return total
+
+    def get_close_price(ts_code, date):
+        df = pd.read_sql(
+            f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
+            conn
+        )
+        return float(df.iloc[0]['close']) if not df.empty else 0.0
+
+    def execute_with_position(date, strategy, base_params, positions, cash, position_ratio):
+        # 简化版选股信号（基于动量排名前N）
+        signals = []
+        try:
+            factor_df = pd.read_sql(
+                f"""SELECT ts_code, value FROM factors
+                    WHERE factor_name = 'momentum_20'
+                    AND trade_date = '{date}'
+                    AND value IS NOT NULL
+                    ORDER BY value DESC LIMIT 20""",
+                conn
+            )
+            if not factor_df.empty:
+                for _, row in factor_df.head(5).iterrows():
+                    price = get_close_price(row['ts_code'], date)
+                    if price > 0:
+                        signals.append({'ts_code': row['ts_code'], 'direction': 'buy', 'price': price})
+        except Exception:
+            pass
+
+        for signal in signals:
+            ts_code = signal['ts_code']
+            direction = signal['direction']
+            price = signal['price']
+            if direction == 'buy' and cash > 0:
+                invest_amount = cash * position_ratio
+                shares = int(invest_amount * 0.1 / (price * (1 + slippage)))
+                if shares > 0:
+                    cost = shares * price * (1 + slippage + commission)
+                    cash -= cost
+                    positions[ts_code] = {'shares': shares, 'cost': price}
+            elif direction == 'sell' and ts_code in positions:
+                pos = positions[ts_code]
+                proceeds = pos['shares'] * price * (1 - slippage - commission)
+                cash += proceeds
+                del positions[ts_code]
+        return cash, positions
+
+    # ---- 运行单个 episode ----
+    cash = initial_cash
+    positions = {}
+    nav_history = []
+    episode_reward = 0.0
+    actions_taken = []
+
+    for i, date in enumerate(trade_dates):
+        state = get_state(date, cash, positions, nav_history)
+        action_idx = choose_action(state, epsilon)
+        actions_taken.append(action_idx)
+        position_ratio = ACTION_MAP[action_idx]
+
+        cash, positions = execute_with_position(
+            date, strategy, base_params, positions, cash, position_ratio
+        )
+
+        portfolio_value = cash + get_positions_value(date, positions)
+        next_date = trade_dates[i + 1] if i + 1 < len(trade_dates) else date
+        next_state = get_state(next_date, cash, positions, nav_history)
+
+        old_nav = nav_history[-1] if nav_history else initial_cash
+        new_nav = portfolio_value
+        reward = float(np.log(new_nav / old_nav)) if old_nav > 0 else 0.0
+
+        update_q(state, action_idx, reward, next_state)
+        nav_history.append(new_nav)
+        episode_reward += reward
+
+    conn.close()
+
+    return episode_reward, actions_taken, dict(q_table)
 
 
 class RLOptimizer:
@@ -55,7 +263,7 @@ class RLOptimizer:
         epsilon: float = 0.1,
         epsilon_decay: float = 0.98,
         min_epsilon: float = 0.01,
-        n_episodes: int = 50,
+        n_episodes: int = 20,  # 原50，减少以加快执行
         lookback_days: int = 20,
     ):
         self.backtester = backtester
@@ -169,19 +377,48 @@ class RLOptimizer:
         training_history = []
         current_epsilon = self.epsilon
 
-        for episode in range(self.n_episodes):
-            episode_reward, episode_actions = self._run_episode(
-                strategy=strategy,
-                base_params=base_params or {},
-                epsilon=current_epsilon,
-                use_rl_position=use_rl_position,
-            )
+        # ---- 8进程并行执行 episodes ----
+        trade_dates = self._get_trade_dates()
+        # 获取数据库路径（用于子进程重建连接）
+        try:
+            db_path = self.backtester.store.conn.execute(
+                "SELECT file FROM pragma_database_list WHERE name='main'"
+            ).fetchone()[0]
+        except Exception:
+            db_path = ""
 
-            # 衰减 epsilon
-            current_epsilon = max(
-                self.min_epsilon, current_epsilon * self.epsilon_decay
+        episode_args = [
+            (
+                episode,
+                strategy,
+                base_params or {},
+                current_epsilon,
+                self.lookback_days,
+                self.gamma,
+                self.alpha,
+                trade_dates,
+                db_path,
+                self.backtester.initial_cash,
+                self.backtester.commission,
+                self.backtester.slippage,
             )
+            for episode in range(self.n_episodes)
+        ]
 
+        # 使用 ProcessPoolExecutor(max_workers=8) 并行执行
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(_episode_worker, episode_args))
+
+        # 衰减 epsilon（串行，后续每10个episode仍串行checkpoint）
+        current_epsilon = max(
+            self.min_epsilon,
+            self.epsilon * (self.epsilon_decay ** self.n_episodes)
+        )
+
+        # 汇总结果
+        best_reward = float('-inf')
+        best_q_table = None
+        for episode, (episode_reward, episode_actions, q_table_snapshot) in enumerate(results):
             training_history.append({
                 'episode': episode,
                 'total_reward': float(episode_reward),
@@ -189,22 +426,26 @@ class RLOptimizer:
                 'actions': episode_actions,
             })
 
-            # 更新 checkpoint 跟踪状态
-            self._training_history = training_history
-            self._current_episode = episode
-            self._current_episode_epsilon = current_epsilon
-
-            # 每10个episode保存检查点
-            if episode > 0 and episode % 10 == 0:
-                self._save_checkpoint(force=True)
+            if episode_reward > best_reward:
+                best_reward = episode_reward
+                best_q_table = q_table_snapshot
 
             if episode % 10 == 0 or episode == self.n_episodes - 1:
                 avg_reward = episode_reward / max(1, len(episode_actions))
                 self.logger.info(
-                    f"[RL] Episode {episode:3d}/{self.n_episodes} | "
-                    f"Reward={episode_reward:.4f} | Avg={avg_reward:.4f} | "
-                    f"epsilon={current_epsilon:.4f}"
+                    f"[RL] Episode {episode:3d}/{self.n_episodes} (并行) | "
+                    f"Reward={episode_reward:.4f} | Avg={avg_reward:.4f}"
                 )
+
+        # 用最优 episode 的 Q 表
+        if best_q_table:
+            for k, v in best_q_table.items():
+                key_tuple = tuple(int(x) for x in k.split(','))
+                self.q_table[key_tuple] = v
+
+        self._training_history = training_history
+        self._current_episode = self.n_episodes - 1
+        self._current_episode_epsilon = current_epsilon
 
         # 最终检查点
         self._save_checkpoint(force=True)

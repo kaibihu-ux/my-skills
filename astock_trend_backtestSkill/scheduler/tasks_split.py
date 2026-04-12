@@ -1013,7 +1013,7 @@ def job_step3_rl(force_restart=False):
         bt_executor, logger,
         start_date=start_date, end_date=end_date,
         gamma=0.95, alpha=0.1, epsilon=0.1,
-        n_episodes=50, lookback_days=20,
+        n_episodes=20, lookback_days=20,  # 原50
     )
     rl_result = rl_opt.optimize(rl_strategy, ga_best_params, use_rl_position=True)
     rl_best_sharpe = rl_result.get('final_sharpe', -999)

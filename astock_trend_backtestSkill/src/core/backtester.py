@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
 
 
 class BacktestExecutor:
@@ -345,6 +346,56 @@ class BacktestExecutor:
             nav_history.append({'date': date, 'nav': portfolio_value})
         
         return self._calc_metrics(trades, nav_history)
+
+    # ------------------------------------------------------------------
+    # 并行回测（8线程）
+    # ------------------------------------------------------------------
+
+    def parallel_run(
+        self,
+        strategy: Dict,
+        params_list: List[Dict],
+        start_date: str,
+        end_date: str,
+        max_workers: int = 8,
+    ) -> List[Dict]:
+        """
+        并行运行多个参数组合的回测（使用 ThreadPoolExecutor）
+        适用于 Step5 Final 阶段的多参数 Grid Search
+
+        Args:
+            strategy: 策略定义（因子列表等）
+            params_list: 参数组合列表，如 [{'top_n_stocks': 20, ...}, {...}]
+            start_date: 回测开始日期
+            end_date: 回测结束日期
+            max_workers: 最大并行线程数，默认8
+
+        Returns:
+            List[Dict]: 每个参数组合的回测结果
+        """
+        self.logger.info(
+            f"[Backtester] 启动并行回测 | 参数组合数={len(params_list)}, 最大并发={max_workers}"
+        )
+
+        def _run_single(params: Dict) -> Dict:
+            try:
+                result = self.run(
+                    strategy=strategy,
+                    params=params,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                result['params'] = params
+                return result
+            except Exception as e:
+                self.logger.warning(f"[Backtester] 参数组合回测失败: {params}, 错误: {e}")
+                return {'params': params, 'error': str(e), 'sharpe_ratio': 0.0}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_run_single, params_list))
+
+        self.logger.info(f"[Backtester] 并行回测完成 | 成功={sum(1 for r in results if 'error' not in r)}/{len(results)}")
+        return results
     
     def _get_close_price(self, ts_code: str, date: str) -> float:
         """获取指定日期收盘价"""
