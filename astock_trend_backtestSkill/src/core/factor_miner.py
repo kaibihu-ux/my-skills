@@ -412,6 +412,10 @@ class FactorMiner:
             return self.calculator.calc_momentum(df, 60)
         elif factor_name == 'momentum_120':
             return self.calculator.calc_momentum(df, 120)
+        elif factor_name == 'momentum_250':
+            return self.calculator.calc_momentum(df, 250)
+        elif factor_name == 'volatility_120':
+            return self.calculator.calc_volatility(df, 120)
         elif factor_name == 'volatility_20':
             return self.calculator.calc_volatility(df, 20)
         elif factor_name == 'volatility_60':

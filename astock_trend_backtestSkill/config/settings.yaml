@@ -7,7 +7,7 @@ stock_pool:
 
 backtest:
   start_date: "20240101"
-  end_date: "20231231"
+  end_date: "20260327"
   initial_cash: 10000000
   commission: 0.0003
   slippage: 0.001
