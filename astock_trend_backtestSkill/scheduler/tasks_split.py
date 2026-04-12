@@ -969,7 +969,7 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
 # Step 3: RL 强化学习仓位优化
 # =============================================================================
 
-@timeout(1 * 3600)
+@timeout(3 * 3600)
 def job_step3_rl(force_restart=False):
     """非交易日 12:00 | Step3: RL 强化学习仓位优化"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1013,7 +1013,7 @@ def job_step3_rl(force_restart=False):
         bt_executor, logger,
         start_date=start_date, end_date=end_date,
         gamma=0.95, alpha=0.1, epsilon=0.1,
-        n_episodes=20, lookback_days=20,  # 原50
+        n_episodes=5, lookback_days=20,  # 原50
     )
     rl_result = rl_opt.optimize(rl_strategy, ga_best_params, use_rl_position=True)
     rl_best_sharpe = rl_result.get('final_sharpe', -999)

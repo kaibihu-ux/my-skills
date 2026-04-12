@@ -48,7 +48,7 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
 
     # 在子进程中重建必要的数据库连接（避免 Store 对象不可 pickle）
     import duckdb
-    conn = duckdb.connect(store_info, read_only=True)
+    conn = duckdb.connect(store_info)
 
     class MiniStore:
         def __init__(self, conn):
@@ -263,7 +263,7 @@ class RLOptimizer:
         epsilon: float = 0.1,
         epsilon_decay: float = 0.98,
         min_epsilon: float = 0.01,
-        n_episodes: int = 20,  # 原50，减少以加快执行
+        n_episodes: int = 5,  # 原50，减少以加快执行
         lookback_days: int = 20,
     ):
         self.backtester = backtester
@@ -382,12 +382,11 @@ class RLOptimizer:
         # ---- 8进程并行执行 episodes ----
         trade_dates = self._get_trade_dates()
         # 获取数据库路径（用于子进程重建连接）
+        # DuckDB 文件数据库的 pragma_database_list 返回 NULL，改用 store.db_path
         try:
-            db_path = self.backtester.store.conn.execute(
-                "SELECT file FROM pragma_database_list WHERE name='main'"
-            ).fetchone()[0]
+            db_path = str(self.backtester.store.db_path)
         except Exception:
-            db_path = ""
+            db_path = "data/astock_full.duckdb"
 
         episode_args = [
             (
