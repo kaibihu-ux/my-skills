@@ -17,7 +17,9 @@ class BayesianOptimizer:
     def optimize(self, strategy: Dict, n_trials: int = 50) -> Dict:
         """优化策略参数"""
         # 预加载回测数据到内存，避免每次 trial 重复查询 DuckDB
-        self.backtester.preload_data(self.start_date, self.end_date)
+        # 只加载策略使用的因子，减少内存占用
+        factor_names = strategy.get('factors', [])
+        self.backtester.preload_data(self.start_date, self.end_date, factor_names)
 
         def objective(trial):
             params = {
@@ -61,7 +63,9 @@ class GridSearchOptimizer:
         all_combinations = list(itertools.product(*values))
 
         # 预加载回测数据到内存，避免每个组合重复查询 DuckDB
-        self.backtester.preload_data(self.start_date, self.end_date)
+        # 只加载策略使用的因子，减少内存占用
+        factor_names = strategy.get('factors', [])
+        self.backtester.preload_data(self.start_date, self.end_date, factor_names)
 
         def _eval_combo(combo):
             params = dict(zip(keys, combo))

@@ -41,13 +41,15 @@ class BacktestExecutor:
             except ImportError:
                 self.logger.warning("[Backtester] 无法导入 Neutralizer")
 
-    def preload_data(self, start_date: str, end_date: str):
+    def preload_data(self, start_date: str, end_date: str, factor_names: list = None):
         """
         预加载回测期间所有股票数据到内存，大幅加速多次回测。
 
         将 DuckDB 中的 stock_daily 和 factors 表数据一次性加载到内存缓存，
         后续 _get_close_price、_get_signals 等方法全部走内存查表，
         避免 240 组合 × 539 天 的重复 SQL 查询。
+        
+        factor_names: 可选，指定要加载的因子名称列表。如果为 None，则加载所有因子。
         """
         import time
         t0 = time.time()
@@ -106,10 +108,15 @@ class BacktestExecutor:
         except Exception as e:
             self.logger.warning(f"[Preload] 日均成交量加载失败: {e}")
 
-        # ---- 加载因子数据（所有因子）----
+        # ---- 加载因子数据（可指定因子列表）----
+        if factor_names and len(factor_names) > 0:
+            factor_list = "', '".join(factor_names)
+            factor_filter = f"AND factor_name IN ('{factor_list}')"
+        else:
+            factor_filter = ""
         factor_df = self.store.df(
             f"SELECT factor_name, ts_code, trade_date, value FROM factors "
-            f"WHERE trade_date >= '{start_fmt}' AND trade_date <= '{end_fmt}' AND value IS NOT NULL"
+            f"WHERE trade_date >= '{start_fmt}' AND trade_date <= '{end_fmt}' AND value IS NOT NULL {factor_filter}"
         )
         for _, row in factor_df.iterrows():
             factor_name = row['factor_name']

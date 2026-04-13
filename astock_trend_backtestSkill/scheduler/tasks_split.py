@@ -1110,6 +1110,9 @@ def job_step4_bayes(force_restart=False):
 
     start_date = '20240101'
     end_date = '20260327'
+    # 使用较短的回测区间进行参数精调，减少内存占用
+    bayes_start_date = '20250101'
+    bayes_end_date = '20260327'
     ga_best_factors = ckpt3.get('ga_best_factors', [])
     ga_best_params = ckpt3.get('ga_best_params', {})
     rl_best_sharpe = ckpt3.get('rl_best_sharpe', -999)
@@ -1123,25 +1126,24 @@ def job_step4_bayes(force_restart=False):
         'factors': final_factors,
     }
 
-    # Bayesian 优化
+    # Bayesian 优化（使用较短区间和较少试验次数以减少内存占用）
     print(f"[{now}] Step4.1: Bayesian 参数精调...")
-    bayes_opt = BayesianOptimizer(bt_executor, logger, start_date=start_date, end_date=end_date)
+    bayes_opt = BayesianOptimizer(bt_executor, logger, start_date=bayes_start_date, end_date=bayes_end_date)
     try:
-        bayes_result = bayes_opt.optimize(final_strat, n_trials=20)
+        bayes_result = bayes_opt.optimize(final_strat, n_trials=10)
         bayes_sharpe = bayes_result.get('best_value', -999)
     except Exception as e:
         logger.warning(f"Bayesian优化失败: {e}")
         bayes_result = {'best_params': {}, 'best_value': -999}
         bayes_sharpe = -999
 
-    # Grid 搜索
+    # Grid 搜索（使用较短区间和较少参数组合以减少内存占用）
     print(f"[{now}] Step4.2: Grid 参数搜索...")
-    grid_opt = GridSearchOptimizer(bt_executor, logger, start_date=start_date, end_date=end_date)
+    grid_opt = GridSearchOptimizer(bt_executor, logger, start_date=bayes_start_date, end_date=bayes_end_date)
     grid_params = {
-        'holding_period': [5, 10, 20, 40, 60],
-        'stop_loss': [0.05, 0.08, 0.10, 0.15],
-        'take_profit': [0.15, 0.20, 0.25, 0.30],
-        'weight_scheme': ['equal', 'ic_weighted', 'volatility_inverse'],
+        'holding_period': [5, 10, 20],
+        'stop_loss': [0.08, 0.10, 0.15],
+        'take_profit': [0.15, 0.20, 0.25],
     }
     try:
         grid_result = grid_opt.optimize(final_strat, grid_params)
