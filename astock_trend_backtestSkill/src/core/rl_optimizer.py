@@ -289,6 +289,12 @@ class RLOptimizer:
         self._nav_history: List[float] = []
         self._price_history: Dict[str, List[float]] = {}
 
+        # ---- 内存缓存（由 load_all_data_to_memory 填充）----
+        self._market_index_cache: Dict[str, float] = {}   # {date: close_price}
+        self._momentum_factor_cache: Dict[str, float] = {}  # {date: avg_mom_value}
+        self._volatility_factor_cache: Dict[str, float] = {} # {date: avg_vol_value}
+        self._data: Optional[pd.DataFrame] = None           # 全量日线数据
+
         # ---- 检查点 ----
         self._checkpoint_path: Optional[Path] = None
         self._checkpoint_lock = threading.Lock()
@@ -389,7 +395,7 @@ class RLOptimizer:
         return result
 
     def load_all_data_to_memory(self) -> pd.DataFrame:
-        """预加载所有历史数据到内存 DataFrame"""
+        """预加载所有历史数据到内存 DataFrame，并填充缓存"""
         try:
             df = self.backtester.store.df(
                 f"""SELECT trade_date, ts_code, close, volume, amount
@@ -398,6 +404,58 @@ class RLOptimizer:
                     ORDER BY trade_date, ts_code"""
             )
             self.logger.info(f"[RL] 已加载 {len(df)} 条数据到内存")
+
+            # ---- 填充市场指数缓存 ----
+            index_df = df[df['ts_code'] == '000001.SH'][['trade_date', 'close']].copy()
+            index_df = index_df.sort_values('trade_date')
+            self._market_index_cache = {
+                str(r['trade_date']): float(r['close'])
+                for _, r in index_df.iterrows()
+            }
+
+            # ---- 填充动量因子缓存 ----
+            try:
+                mom_df = self.backtester.store.df(
+                    f"""SELECT trade_date, AVG(value) as avg_mom
+                        FROM factors
+                        WHERE factor_name = 'momentum_20'
+                        AND trade_date BETWEEN '{self.start_date}' AND '{self.end_date}'
+                        GROUP BY trade_date
+                        ORDER BY trade_date"""
+                )
+                self._momentum_factor_cache = {
+                    str(r['trade_date']): float(r['avg_mom'])
+                    for _, r in mom_df.iterrows()
+                    if r['avg_mom'] is not None
+                }
+            except Exception as e:
+                self.logger.warning(f"[RL] 动量因子缓存加载失败: {e}")
+
+            # ---- 填充波动率因子缓存 ----
+            try:
+                vol_df = self.backtester.store.df(
+                    f"""SELECT trade_date, AVG(value) as avg_vol
+                        FROM factors
+                        WHERE factor_name = 'volatility_20'
+                        AND trade_date BETWEEN '{self.start_date}' AND '{self.end_date}'
+                        GROUP BY trade_date
+                        ORDER BY trade_date"""
+                )
+                self._volatility_factor_cache = {
+                    str(r['trade_date']): float(r['avg_vol'])
+                    for _, r in vol_df.iterrows()
+                    if r['avg_vol'] is not None
+                }
+            except Exception as e:
+                self.logger.warning(f"[RL] 波动率因子缓存加载失败: {e}")
+
+            # 保存 data DataFrame 供 _get_positions_value 使用
+            self._data = df
+            self.logger.info(
+                f"[RL] 缓存填充完成 | market_index={len(self._market_index_cache)}, "
+                f"momentum={len(self._momentum_factor_cache)}, "
+                f"volatility={len(self._volatility_factor_cache)}"
+            )
             return df
         except Exception as e:
             self.logger.warning(f"[RL] 加载数据失败：{e}")
@@ -867,59 +925,34 @@ class RLOptimizer:
         return df['trade_date'].astype(str).tolist()
 
     def _get_market_return(self, date: str) -> float:
-        """获取截至 date 的市场指数收益率"""
+        """获取截至 date 的市场指数收益率（使用缓存）"""
+        if not self._market_index_cache:
+            return self._get_market_return_original(date)
         try:
-            idx_prices = self.backtester.store.df(
-                f"""SELECT trade_date, close FROM stock_daily
-                    WHERE ts_code = '000001.SH'
-                    AND trade_date <= '{date}'
-                    ORDER BY trade_date DESC
-                    LIMIT {self.lookback_days}"""
-            )
-            if len(idx_prices) >= 2:
-                ret = (idx_prices.iloc[0]['close'] - idx_prices.iloc[-1]['close']) \
-                      / idx_prices.iloc[-1]['close']
-                return float(ret)
+            dates_sorted = sorted(self._market_index_cache.keys())
+            d_idx = None
+            for i, d in enumerate(dates_sorted):
+                if d <= date:
+                    d_idx = i
+            if d_idx is None or d_idx < self.lookback_days:
+                return 0.0
+            start_date = dates_sorted[d_idx - self.lookback_days]
+            ret = (self._market_index_cache[date] - self._market_index_cache[start_date]) \
+                  / self._market_index_cache[start_date]
+            return float(ret)
         except Exception:
-            pass
-        return 0.0
+            return 0.0
 
     def _get_momentum_return(self, date: str) -> float:
-        """获取近期动量收益"""
-        try:
-            dt = pd.to_datetime(date)
-            start_dt = dt - pd.Timedelta(days=int(self.lookback_days * 1.5))
-            start_str = start_dt.strftime('%Y-%m-%d')
-
-            mom_df = self.backtester.store.df(
-                f"""SELECT AVG(value) as avg_mom FROM factors
-                    WHERE factor_name = 'momentum_20'
-                    AND trade_date BETWEEN '{start_str}' AND '{date}'
-                    AND value IS NOT NULL"""
-            )
-            if not mom_df.empty and mom_df.iloc[0]['avg_mom'] is not None:
-                return float(mom_df.iloc[0]['avg_mom'])
-        except Exception:
-            pass
+        """获取近期动量收益（使用缓存）"""
+        if date in self._momentum_factor_cache:
+            return self._momentum_factor_cache[date]
         return 0.0
 
     def _get_volatility(self, date: str) -> float:
-        """获取近期波动率"""
-        try:
-            dt = pd.to_datetime(date)
-            start_dt = dt - pd.Timedelta(days=int(self.lookback_days * 1.5))
-            start_str = start_dt.strftime('%Y-%m-%d')
-
-            vol_df = self.backtester.store.df(
-                f"""SELECT AVG(value) as avg_vol FROM factors
-                    WHERE factor_name = 'volatility_20'
-                    AND trade_date BETWEEN '{start_str}' AND '{date}'
-                    AND value IS NOT NULL"""
-            )
-            if not vol_df.empty and vol_df.iloc[0]['avg_vol'] is not None:
-                return float(vol_df.iloc[0]['avg_vol'])
-        except Exception:
-            pass
+        """获取近期波动率（使用缓存）"""
+        if date in self._volatility_factor_cache:
+            return self._volatility_factor_cache[date]
         return 0.02  # 默认中等波动
 
     def _execute_with_position(
@@ -978,15 +1011,14 @@ class RLOptimizer:
         return cash, positions
 
     def _get_positions_value(self, date: str, positions: Dict) -> float:
-        """计算持仓市值"""
+        """计算持仓市值（使用内存 DataFrame）"""
+        if self._data is None or self._data.empty:
+            return 0.0
         total = 0.0
+        date_str = str(date)
+        day_data = self._data[self._data['trade_date'].astype(str) == date_str]
+        close_map = dict(zip(day_data['ts_code'].astype(str), day_data['close']))
         for ts_code, pos in positions.items():
-            try:
-                df = self.backtester.store.df(
-                    f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'"
-                )
-                if not df.empty:
-                    total += pos['shares'] * float(df.iloc[0]['close'])
-            except Exception:
-                pass
+            if ts_code in close_map:
+                total += pos['shares'] * float(close_map[ts_code])
         return total

@@ -174,6 +174,11 @@ class GeneticOptimizer:
         else:
             population = self._init_population(initial_pop)
 
+        # ---- 预加载回测数据 ----
+        self.logger.info("[GA] 预加载回测数据...")
+        self.backtester.preload_data(self.start_date, self.end_date)
+        self.logger.info("[GA] 预加载完成，开始进化...")
+
         # ---- 主循环 ----
         for gen in range(_resume_from, _resume_from + n_gens_to_run):
             if HAS_JOBLIB and self._n_jobs > 1:
