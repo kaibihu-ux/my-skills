@@ -205,3 +205,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# algorithmic-trading skill
+algorithmic-trading/data/
+algorithmic-trading/output/
+algorithmic-trading/checkpoint_state.json
+algorithmic-trading/cache/
+algorithmic-trading/venv/
+algorithmic-trading/__pycache__/
+algorithmic-trading/scripts/__pycache__/
+*.pyc
+*.log

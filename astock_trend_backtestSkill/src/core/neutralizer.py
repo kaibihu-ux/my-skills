@@ -140,8 +140,9 @@ class Neutralizer:
             mask = industry == ind
             if mask.sum() < 1:
                 continue
-            ind_mean = np.mean(factor[mask])
-            result[mask] = factor[mask] - ind_mean
+            # 用 nanmean 而非 mean，避免 NaN 因子值污染均值；同时基于 winsorize 后的 result 而非原始 factor
+            ind_mean = np.nanmean(result[mask])
+            result[mask] = result[mask] - ind_mean
 
         return result
 
@@ -311,31 +312,40 @@ class Neutralizer:
         返回中性化后的因子名列表（格式：原名_neutralized）
         使用 joblib 8进程并行计算（写入串行执行）
         """
+        start_fmt = self._format_date(start_date)
+        end_fmt = self._format_date(end_date)
+
+        # ---- 预加载所有因子数据（避免并行 worker 内重复 SQL 查询）----
+        factor_df = self.store.df(f"""
+            SELECT factor_name, ts_code, trade_date, value
+            FROM factors
+            WHERE trade_date BETWEEN '{start_fmt}' AND '{end_fmt}'
+              AND value IS NOT NULL
+            ORDER BY trade_date, ts_code
+        """)
+        # 按因子名拆分
+        factor_by_name: Dict[str, pd.DataFrame] = {}
+        for fname in factor_names:
+            sub = factor_df[factor_df['factor_name'] == fname].copy()
+            if not sub.empty:
+                factor_by_name[fname] = sub
+
+        # ---- 预加载市值数据（所有日期，一次性查完）----
+        mcap_df = self.store.df(f"""
+            SELECT ts_code, trade_date, close * vol as mcap
+            FROM stock_daily
+            WHERE trade_date BETWEEN '{start_fmt}' AND '{end_fmt}'
+              AND close > 0 AND vol > 0
+        """)
+
         def _neutralize_one(fname: str):
             """单个因子中性化（供并行调用，返回待写入 DataFrame 或 None）"""
             try:
-                start_fmt = self._format_date(start_date)
-                end_fmt = self._format_date(end_date)
-
-                df = self.store.df(f"""
-                    SELECT ts_code, trade_date, value
-                    FROM factors
-                    WHERE factor_name = '{fname}'
-                      AND trade_date BETWEEN '{start_fmt}' AND '{end_fmt}'
-                      AND value IS NOT NULL
-                    ORDER BY trade_date, ts_code
-                """)
-                if df.empty:
+                if fname not in factor_by_name:
                     self._log(f"中性化跳过（无数据）: {fname}")
                     return fname, None
 
-                mcap_df = self.store.df(f"""
-                    SELECT ts_code, trade_date, close * vol as mcap
-                    FROM stock_daily
-                    WHERE trade_date BETWEEN '{start_fmt}' AND '{end_fmt}'
-                      AND close > 0 AND vol > 0
-                """)
-
+                df = factor_by_name[fname].copy()
                 merged = df.merge(mcap_df, on=['ts_code', 'trade_date'], how='inner')
                 if merged.empty or len(merged) < 100:
                     self._log(f"中性化跳过（合并不足）: {fname}")

@@ -47,6 +47,7 @@ def post_market():
         print(f"[{now}] 下载今日数据（强制全量，确保收盘价）...")
         try:
             # force=True：跳过"已有数据"检查，强制全量拉取，确保收盘价而非盘中实时价
+            # 内部已含探查逻辑：若今日数据未发布则不删旧数据，直接返回0
             api.data_mgr.update_daily(today_str, today_str, force=True)
             print(f"[{now}] 今日数据下载完成")
         except Exception as e:

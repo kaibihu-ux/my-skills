@@ -26,6 +26,8 @@ class BacktestExecutor:
         self._factor_cache = {}  # {(factor_name, ts_code, trade_date): value}
         self._price_by_date = {} # {trade_date: {ts_code: close_price}}  # 日期索引，加速 _get_signals
         self._factor_by_date = {}  # {trade_date: {factor_name: {ts_code: value}}}  # 因子缓存
+        self._avg_vol_cache = {}  # {(ts_code, trade_date): avg_vol_20}  # 日均成交量缓存（用于中性化市值估算）
+        self._industry_cache = {}  # {ts_code: industry}  # 行业缓存（静态数据，初始化时加载一次）
 
     def _init_neutralizer(self):
         """初始化因子中性化器"""
@@ -57,6 +59,18 @@ class BacktestExecutor:
         self._price_by_date.clear()
         self._factor_cache.clear()
         self._factor_by_date.clear()
+        self._avg_vol_cache.clear()
+
+        # ---- 加载行业数据（静态数据，初始化一次）----
+        try:
+            industry_df = self.store.df(
+                "SELECT ts_code, industry FROM stock_list WHERE industry IS NOT NULL AND industry != ''"
+            )
+            self._industry_cache = {}
+            for _, row in industry_df.iterrows():
+                self._industry_cache[str(row['ts_code'])] = str(row['industry'])
+        except Exception:
+            self._industry_cache = {}
 
         # ---- 加载价格数据 ----
         price_df = self.store.df(
@@ -71,6 +85,26 @@ class BacktestExecutor:
             if trade_date not in self._price_by_date:
                 self._price_by_date[trade_date] = {}
             self._price_by_date[trade_date][ts_code] = close
+
+        # ---- 加载日均成交量数据（用于市值估算）----
+        try:
+            avg_vol_df = self.store.df(f"""
+                SELECT ts_code, trade_date,
+                       AVG(vol) OVER (
+                           PARTITION BY ts_code
+                           ORDER BY trade_date
+                           ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                       ) as avg_vol_20
+                FROM stock_daily
+                WHERE trade_date >= '{start_fmt}' AND trade_date <= '{end_fmt}' AND vol > 0
+            """)
+            for _, row in avg_vol_df.iterrows():
+                ts_code = row['ts_code']
+                trade_date = str(row['trade_date'])
+                avg_vol = float(row['avg_vol_20'])
+                self._avg_vol_cache[(ts_code, trade_date)] = avg_vol
+        except Exception as e:
+            self.logger.warning(f"[Preload] 日均成交量加载失败: {e}")
 
         # ---- 加载因子数据（所有因子）----
         factor_df = self.store.df(
@@ -295,16 +329,13 @@ class BacktestExecutor:
                 portfolio_value = cash + total_pos_value
 
                 if weight_scheme == 'ic_weighted':
-                    # 按 IC 分配（简化：直接用动量因子值作为权重）
+                    # 按 IC 分配（直接用动量因子值作为权重，走缓存）
                     for ts_code, pos in positions.items():
-                        try:
-                            ic_df = self.store.df(
-                                f"SELECT value FROM factors WHERE factor_name = 'momentum_20' AND ts_code = '{ts_code}' AND trade_date = '{date}' LIMIT 1"
-                            )
-                            if not ic_df.empty:
-                                ic_val = float(ic_df.iloc[0]['value']) + 1e-6
-                                target_weights[ts_code] = max(0, ic_val)
-                        except Exception:
+                        date_str = str(date)
+                        ic_val = self._factor_cache.get(('momentum_20', ts_code, date_str), None)
+                        if ic_val is not None:
+                            target_weights[ts_code] = max(0, ic_val + 1e-6)
+                        else:
                             target_weights[ts_code] = 1.0
                     # 归一化
                     total_w = sum(target_weights.values())
@@ -312,16 +343,13 @@ class BacktestExecutor:
                         target_weights = {k: v / total_w for k, v in target_weights.items()}
 
                 elif weight_scheme == 'volatility_inverse':
-                    # 按波动率倒数分配
+                    # 按波动率倒数分配，走缓存
                     for ts_code, pos in positions.items():
-                        try:
-                            vol_df = self.store.df(
-                                f"SELECT value FROM factors WHERE factor_name = 'volatility_20' AND ts_code = '{ts_code}' AND trade_date = '{date}' LIMIT 1"
-                            )
-                            if not vol_df.empty:
-                                vol_val = float(vol_df.iloc[0]['value']) + 1e-6
-                                target_weights[ts_code] = 1.0 / vol_val
-                        except Exception:
+                        date_str = str(date)
+                        vol_val = self._factor_cache.get(('volatility_20', ts_code, date_str), None)
+                        if vol_val is not None:
+                            target_weights[ts_code] = 1.0 / max(vol_val + 1e-6, 1e-8)
+                        else:
                             target_weights[ts_code] = 1.0
                     # 归一化
                     total_w = sum(target_weights.values())
@@ -499,32 +527,39 @@ class BacktestExecutor:
         date: str,
     ) -> pd.DataFrame:
         """
-        对因子值进行中性化处理
-
-        加载市值和行业数据，对每个因子应用行业+市值中性化
+        对因子值进行中性化处理（使用预加载缓存，无重复 SQL 查询）
         """
         try:
-            # 加载市值数据（使用成交量 * 价格估算，或者从 stock_list 获取）
-            # 简化：用收盘价 × 日均成交量估算市值代理
-            mcap_df = self.store.df(
-                f"""SELECT ts_code,
-                           close * AVG(vol) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) as mcap_proxy
-                     FROM stock_daily
-                     WHERE trade_date = '{date}'"""
-            )
-            if mcap_df.empty:
-                return merged
-            merged = merged.merge(mcap_df, on='ts_code', how='left')
+            date_str = str(date)
 
-            # 加载行业数据（从 stock_list）
-            industry_df = self.store.df(
-                "SELECT ts_code, industry FROM stock_list WHERE industry IS NOT NULL AND industry != ''"
-            )
-            if not industry_df.empty:
-                merged = merged.merge(industry_df, on='ts_code', how='left')
-                merged['industry'] = merged['industry'].fillna('Unknown')
+            # 使用预加载的收盘价和日均成交量估算市值代理：close × avg_vol_20
+            if date_str in self._price_by_date:
+                price_map = self._price_by_date[date_str]
+                mcap_list = []
+                for ts_code in merged['ts_code'].values:
+                    close = price_map.get(ts_code, 0.0)
+                    avg_vol = self._avg_vol_cache.get((ts_code, date_str), 0.0)
+                    # 市值代理 = close × avg_vol_20（价量乘积作为流动性的代理）
+                    mcap_list.append(close * avg_vol if close > 0 and avg_vol > 0 else 1.0)
             else:
-                merged['industry'] = 'Unknown'
+                # 兜底：全部用 1.0
+                mcap_list = [1.0] * len(merged)
+
+            if 'mcap_proxy' not in merged.columns:
+                merged['mcap_proxy'] = mcap_list
+            else:
+                merged['mcap_proxy'] = mcap_list
+
+            # 使用预加载的行业缓存（静态数据，无需每日查询）
+            if self._industry_cache:
+                industry_list = [self._industry_cache.get(ts, 'Unknown') for ts in merged['ts_code'].values]
+            else:
+                industry_list = ['Unknown'] * len(merged)
+
+            if 'industry' not in merged.columns:
+                merged['industry'] = industry_list
+            else:
+                merged['industry'] = industry_list
 
             # 对每个因子执行中性化
             for fname in factor_names:

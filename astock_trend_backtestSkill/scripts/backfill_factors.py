@@ -55,22 +55,22 @@ def main():
     except Exception as e:
         print(f"[{datetime.now()}] ❌ 执行失败: {e}")
 
-    # 3. 验证
-    api2 = get_instance()
-    store2 = api2.store
-    result = store2.conn.execute(
+    # 3. 验证（直接用 duckdb，不走 api 避免单例连接问题）
+    import duckdb as _duckdb
+    _db_path = Path(__file__).parent.parent / "data" / "astock_full.duckdb"
+    conn3 = _duckdb.connect(str(_db_path), read_only=True)
+    result = conn3.execute(
         "SELECT MAX(trade_date), COUNT(*) FROM factors WHERE trade_date >= '2026-03-28'"
     ).fetchone()
     print(f"[{datetime.now()}] 补跑后验证：最新日期={result[0]}, 2026-03-28起共{result[1]}行")
 
-    result2 = store2.conn.execute(
+    result2 = conn3.execute(
         "SELECT factor_name, COUNT(*) as cnt FROM factors WHERE trade_date >= '2026-03-28' GROUP BY factor_name ORDER BY cnt DESC LIMIT 15"
     ).fetchall()
     print(f"[{datetime.now()}] 各因子补跑行数：")
     for row in result2:
         print(f"  {row[0]}: {row[1]}行")
-
-    store2.close()
+    conn3.close()
     print(f"[{datetime.now()}] 🎉 补跑完成")
 
 
