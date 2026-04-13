@@ -16,6 +16,9 @@ class BayesianOptimizer:
 
     def optimize(self, strategy: Dict, n_trials: int = 50) -> Dict:
         """优化策略参数"""
+        # 预加载回测数据到内存，避免每次 trial 重复查询 DuckDB
+        self.backtester.preload_data(self.start_date, self.end_date)
+
         def objective(trial):
             params = {
                 'holding_period': trial.suggest_int('holding_period', 5, 60),
@@ -56,6 +59,9 @@ class GridSearchOptimizer:
         keys = list(param_grid.keys())
         values = list(param_grid.values())
         all_combinations = list(itertools.product(*values))
+
+        # 预加载回测数据到内存，避免每个组合重复查询 DuckDB
+        self.backtester.preload_data(self.start_date, self.end_date)
 
         def _eval_combo(combo):
             params = dict(zip(keys, combo))

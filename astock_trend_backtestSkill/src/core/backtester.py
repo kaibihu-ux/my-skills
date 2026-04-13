@@ -21,6 +21,11 @@ class BacktestExecutor:
         self._ensure_factors_stored()
         # 初始化中性化器
         self._init_neutralizer()
+        # 数据预加载缓存（由 preload_data 填充，避免重复 SQL 查询）
+        self._price_cache = {}   # {(ts_code, trade_date): close_price}
+        self._factor_cache = {}  # {(factor_name, ts_code, trade_date): value}
+        self._price_by_date = {} # {trade_date: {ts_code: close_price}}  # 日期索引，加速 _get_signals
+        self._factor_by_date = {}  # {trade_date: {factor_name: {ts_code: value}}}  # 因子缓存
 
     def _init_neutralizer(self):
         """初始化因子中性化器"""
@@ -33,6 +38,67 @@ class BacktestExecutor:
                 self.logger.info("[Backtester] 中性化器已启用")
             except ImportError:
                 self.logger.warning("[Backtester] 无法导入 Neutralizer")
+
+    def preload_data(self, start_date: str, end_date: str):
+        """
+        预加载回测期间所有股票数据到内存，大幅加速多次回测。
+
+        将 DuckDB 中的 stock_daily 和 factors 表数据一次性加载到内存缓存，
+        后续 _get_close_price、_get_signals 等方法全部走内存查表，
+        避免 240 组合 × 539 天 的重复 SQL 查询。
+        """
+        import time
+        t0 = time.time()
+        start_fmt = self._format_date(start_date)
+        end_fmt = self._format_date(end_date)
+
+        # 清空旧缓存
+        self._price_cache.clear()
+        self._price_by_date.clear()
+        self._factor_cache.clear()
+        self._factor_by_date.clear()
+
+        # ---- 加载价格数据 ----
+        price_df = self.store.df(
+            f"SELECT ts_code, trade_date, close FROM stock_daily "
+            f"WHERE trade_date >= '{start_fmt}' AND trade_date <= '{end_fmt}' AND close > 0"
+        )
+        for _, row in price_df.iterrows():
+            ts_code = row['ts_code']
+            trade_date = str(row['trade_date'])
+            close = float(row['close'])
+            self._price_cache[(ts_code, trade_date)] = close
+            if trade_date not in self._price_by_date:
+                self._price_by_date[trade_date] = {}
+            self._price_by_date[trade_date][ts_code] = close
+
+        # ---- 加载因子数据（所有因子）----
+        factor_df = self.store.df(
+            f"SELECT factor_name, ts_code, trade_date, value FROM factors "
+            f"WHERE trade_date >= '{start_fmt}' AND trade_date <= '{end_fmt}' AND value IS NOT NULL"
+        )
+        for _, row in factor_df.iterrows():
+            factor_name = row['factor_name']
+            ts_code = row['ts_code']
+            trade_date = str(row['trade_date'])
+            value = float(row['value'])
+            self._factor_cache[(factor_name, ts_code, trade_date)] = value
+            if trade_date not in self._factor_by_date:
+                self._factor_by_date[trade_date] = {}
+            if factor_name not in self._factor_by_date[trade_date]:
+                self._factor_by_date[trade_date][factor_name] = {}
+            self._factor_by_date[trade_date][factor_name][ts_code] = value
+
+        elapsed = time.time() - t0
+        self.logger.info(
+            f"[Preload] 价格: {len(self._price_cache):,} 条, "
+            f"因子: {len(self._factor_cache):,} 条, "
+            f"预加载耗时: {elapsed:.1f}s"
+        )
+
+    def _has_cached_data(self) -> bool:
+        """判断缓存是否已加载"""
+        return len(self._price_cache) > 0
 
     def _ensure_factors_stored(self):
         """确保基础因子已存储到 factors 表"""
@@ -398,9 +464,13 @@ class BacktestExecutor:
         return results
     
     def _get_close_price(self, ts_code: str, date: str) -> float:
-        """获取指定日期收盘价"""
+        """获取指定日期收盘价（优先走缓存）"""
+        date_str = str(date)
+        if self._has_cached_data():
+            return self._price_cache.get((ts_code, date_str), 0.0)
+        # 兜底：缓存未加载时查 DuckDB
         df = self.store.df(
-            f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'"
+            f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date_str}'"
         )
         if len(df) > 0:
             return float(df.iloc[0]['close'])
@@ -506,8 +576,10 @@ class BacktestExecutor:
         # 获取调仓频率参数
         rebalance_freq = params.get('rebalance_frequency', 'weekly')
 
-        # 检查是否需要调仓（只有在没有持仓时才强制返回空）
-        if not SignalBuilder.build_rebalance_signal(date, rebalance_freq) and not positions:
+        # 检查是否需要调仓
+        # 注意：每年首日是强制调仓日，即使不是普通调仓日也要生成信号
+        is_forced_rebal = date in rebalance_dates
+        if not SignalBuilder.build_rebalance_signal(date, rebalance_freq) and not is_forced_rebal and not positions:
             return signals
 
         # 判断是否需要再平衡
@@ -519,29 +591,47 @@ class BacktestExecutor:
         top_n = params.get('top_n_stocks', self.top_n)
 
         # ===== 步骤2：多因子打分 =====
-        # 先获取当日收盘价（全部股票）
-        price_df = self.store.df(
-            f"""SELECT ts_code, close 
-                FROM stock_daily 
-                WHERE trade_date = '{date}' AND close > 0"""
-        )
+        # 先获取当日收盘价（全部股票）- 优先从缓存获取
+        date_str = str(date)
+        if self._has_cached_data() and date_str in self._price_by_date:
+            price_map = self._price_by_date[date_str]
+            price_df = pd.DataFrame([
+                {'ts_code': ts, 'close': p} for ts, p in price_map.items() if p > 0
+            ])
+        else:
+            price_df = self.store.df(
+                f"""SELECT ts_code, close
+                     FROM stock_daily
+                     WHERE trade_date = '{date_str}' AND close > 0"""
+            )
         if price_df.empty:
             return signals
 
-        # 逐个因子查询并合并
+        # 逐个因子获取并合并 - 优先从缓存获取
         merged = price_df.copy()
         for factor_name in strategy_factors:
-            factor_col = self.store.df(
-                f"""SELECT ts_code, value
-                     FROM factors
-                     WHERE factor_name = '{factor_name}'
-                       AND trade_date = '{date}'
-                       AND value IS NOT NULL"""
-            )
+            if self._has_cached_data() and date_str in self._factor_by_date:
+                factor_map = self._factor_by_date[date_str].get(factor_name, {})
+                if factor_map:
+                    factor_col = pd.DataFrame([
+                        {'ts_code': ts, factor_name: val} for ts, val in factor_map.items()
+                    ])
+                else:
+                    factor_col = pd.DataFrame(columns=['ts_code', factor_name])
+            else:
+                factor_col = self.store.df(
+                    f"""SELECT ts_code, value
+                         FROM factors
+                         WHERE factor_name = '{factor_name}'
+                           AND trade_date = '{date_str}'
+                           AND value IS NOT NULL"""
+                )
+                if not factor_col.empty:
+                    factor_col = factor_col.rename(columns={'value': factor_name})
             if factor_col.empty:
                 continue
-            # 重命名为因子名
-            factor_col = factor_col.rename(columns={'value': factor_name})
+            if factor_name not in factor_col.columns:
+                factor_col = factor_col.rename(columns={'value': factor_name})
             merged = merged.merge(factor_col, on='ts_code', how='left')
 
         if merged.empty:
