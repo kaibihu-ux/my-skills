@@ -667,13 +667,14 @@ class DataManager:
         # 排除已有数据（force=True 时跳过，强制全量拉取确保收盘价）
         if force:
             to_fetch = list(self._session_codes)
+            self.logger.info(f"baostock基准: {len(self._session_codes)} 只（force模式，强制全量拉取）")
         else:
             existing = set(self.store.df(
                 f"SELECT ts_code FROM stock_daily WHERE trade_date = '{trade_date}'"
             )['ts_code'].tolist())
             to_fetch = [c for c in self._session_codes if c not in existing]
+            self.logger.info(f"baostock基准: {len(self._session_codes)}, 已有: {len(existing)}, 待取: {len(to_fetch)}")
         total = len(to_fetch)
-        self.logger.info(f"baostock基准: {len(self._session_codes)}, 已有: {len(existing)}, 待取: {total}")
 
         if total == 0:
             self.logger.info("无待取数据")

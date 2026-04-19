@@ -43,6 +43,12 @@ from datetime import date as _date
 
 
 # 2026年A股非交易日（周末 + 法定节假日）
+_TRADING_DAYS_EXCEPTIONAL = {
+    # 调休上班日（周末但当交易日），优先级最高
+    '20260228',  # 周六调休上班
+    '20260301',  # 周日调休上班
+}
+
 _NON_TRADING_DAYS_2026 = {
     # 元旦（1月1日）
     '20260101',
@@ -66,6 +72,9 @@ def is_trading_day(d=None):
     if d is None:
         d = _date.today()
     date_str = d.strftime('%Y%m%d')
+    # 调休上班日优先
+    if date_str in _TRADING_DAYS_EXCEPTIONAL:
+        return True
     # 排除节假日
     if date_str in _NON_TRADING_DAYS_2026:
         return False

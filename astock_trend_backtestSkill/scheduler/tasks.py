@@ -42,7 +42,7 @@ from src.core.backtester import BacktestExecutor
 from src.core.optimizer import BayesianOptimizer, GridSearchOptimizer
 
 # 新增模块
-from scheduler.market_watcher import MarketWatcher
+# MarketWatcher 在 job_market_watcher() 中延迟导入，避免循环导入
 from scheduler.pre_market import job_pre_market
 from scheduler.post_market import job_post_market
 from scheduler.weekend_research import job_weekend_research
