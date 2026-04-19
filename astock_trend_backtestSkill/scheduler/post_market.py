@@ -14,6 +14,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api.skill_api import get_instance
+import functools
 
 
 def _normalize_date(date_str: str) -> str:
@@ -191,12 +192,23 @@ def _calc_today_performance(store, today_fmt):
     return {'nav': 1.0, 'daily_return': 0.0, 'cumulative_return': 0.0}
 
 
-def _collect_today_alerts(store, today_fmt):
-    """收集今日预警事件"""
+def _collect_today_alerts(store, today_fmt: str):
+    """收集今日预警事件
+    
+    DuckDB TIMESTAMP类型不支持直接LIKE，需CAST为VARCHAR后匹配。
+    today_fmt 格式为 YYYY-MM-DD，直接前缀匹配即可。
+    """
     alerts = []
     try:
+        # DuckDB TIMESTAMP 不能直接 LIKE string，必须 CAST
         alert_df = store.df(
-            f"SELECT * FROM alerts WHERE created_at LIKE '{today_fmt}%' ORDER BY created_at DESC LIMIT 20"
+            f"""
+            SELECT alert_type, message, CAST(created_at AS VARCHAR) AS created_at
+            FROM alerts
+            WHERE CAST(created_at AS VARCHAR) LIKE '{today_fmt}%'
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
         )
         if not alert_df.empty:
             for _, row in alert_df.iterrows():
@@ -205,8 +217,8 @@ def _collect_today_alerts(store, today_fmt):
                     'message': str(row.get('message', '')),
                     'created_at': str(row.get('created_at', '')),
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 预警收集失败: {e}")
     return alerts
 
 
@@ -243,5 +255,38 @@ def _build_next_day_outlook(perf_today, market_summary):
 
 
 def job_post_market():
-    """调度器入口"""
+    """调度器入口（含超时保护）"""
     return post_market()
+
+
+# 调度器使用的入口点，统一加超时保护
+_post_market_timeout = 3 * 3600  # 3小时超时
+
+
+def _post_market_with_timeout():
+    """带超时保护的 job_post_market 包装"""
+    result = [None]
+    exception = [None]
+
+    def target():
+        try:
+            result[0] = post_market()
+        except Exception as e:
+            exception[0] = e
+
+    t = __import__('threading').Thread(target=target, name='post_market')
+    t.daemon = True
+    t.start()
+    t.join(timeout=_post_market_timeout)
+    if t.is_alive():
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] ⏰ post_market 运行超过 {_post_market_timeout // 3600}h，强制结束")
+        raise TimeoutError(f"post_market timed out after {_post_market_timeout // 3600} hours")
+    if exception[0]:
+        raise exception[0]
+    return result[0]
+
+
+# 供 APScheduler 调度的版本（使用常驻进程模式时）
+def job_post_market_scheduled():
+    return _post_market_with_timeout()
