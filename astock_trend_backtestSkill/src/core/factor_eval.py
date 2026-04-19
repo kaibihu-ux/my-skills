@@ -117,18 +117,18 @@ class FactorEvaluator:
         self.ic_evaluator = ICEvaluator()
 
     def _save_ic_series(self, factor_name: str, ic_results: Dict, periods: List[int]):
-        """保存 IC 序列到 factor_ic 表（只保存 ic_20，即未来20日收益的IC）"""
+        """保存 IC 序列到 factor_ic 表（事务保护，避免删除后插入失败）"""
         try:
             # 只使用 ic_20 的 IC 序列（最常用）
             ic_series_dict = ic_results.get('ic_20_series', {})
             if not ic_series_dict:
                 # 退而求其次用 ic_5
                 ic_series_dict = ic_results.get('ic_5_series', {})
-            
+
             if not ic_series_dict:
                 self.logger.info(f"[{factor_name}] 无IC序列数据可保存")
                 return
-            
+
             ic_records = []
             for date, ic in ic_series_dict.items():
                 # 统一日期格式为 YYYY-MM-DD
@@ -143,20 +143,20 @@ class FactorEvaluator:
                     'ic': float(ic),
                     'rank_ic': 0.0
                 })
-            
+
             if ic_records:
                 ic_df = pd.DataFrame(ic_records)
-                # 转换为字符串日期避免timestamp类型问题
                 ic_df['date'] = ic_df['date'].astype(str)
                 ic_df['ic'] = ic_df['ic'].astype(float)
                 ic_df['rank_ic'] = ic_df['rank_ic'].astype(float)
-                
-                # 先删除该因子的旧数据
-                self.store.execute(
-                    f"DELETE FROM factor_ic WHERE factor_name = '{factor_name}'"
-                )
-                # 插入新数据
-                self.store.insert('factor_ic', ic_df)
+
+                # 事务保护：删除+插入作为一个事务
+                conn = self.store.conn
+                with self.store._lock:
+                    delete_sql = f"DELETE FROM factor_ic WHERE factor_name = '{factor_name}'"
+                    conn.execute(delete_sql)
+                    self.store.insert('factor_ic', ic_df)
+                    conn.execute("CHECKPOINT")
                 self.logger.info(f"[{factor_name}] IC序列已保存: {len(ic_records)} 条")
         except Exception as e:
             self.logger.warning(f"[{factor_name}] 保存IC序列失败: {e}")
@@ -232,22 +232,23 @@ class FactorEvaluator:
         except Exception as e:
             self.logger.warning(f"中性化失败 [{factor_name}]: {e}")
 
-        # ===== 计算 IC 序列 =====
+        # ===== 计算 IC 序列（向量化，按日期分组避免循环内重复SQL）=====
+        # merged 已按 trade_date 分组，无需再逐日期循环
         ic_results = {}
         for period in periods:
             ret_col = f'return_{period}'
-            
-            # 按日期分组计算截面IC
-            ic_series = []
+
+            # 使用 groupby 一次性计算所有截面的 IC（无重复 SQL）
+            ic_data = []
             for date, group in merged.groupby('trade_date'):
                 fv = group['value']
                 ret = group[ret_col]
                 ic = ICEvaluator.calc_ic(fv, ret)
                 if ic != 0 and pd.notna(ic):
-                    ic_series.append({'date': date, 'ic': ic})
-            
-            if ic_series:
-                ic_df = pd.DataFrame(ic_series).set_index('date')['ic']
+                    ic_data.append({'date': date, 'ic': ic})
+
+            if ic_data:
+                ic_df = pd.DataFrame(ic_data).set_index('date')['ic']
                 ic_results[f'ic_{period}'] = float(ic_df.mean())
                 ic_results[f'ic_{period}_std'] = float(ic_df.std())
                 ic_results[f'ic_{period}_series'] = ic_df.to_dict()

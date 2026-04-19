@@ -19,9 +19,14 @@ class DuckDBStore:
         self._lock = threading.RLock()  # 保护所有DB操作
 
     def _cleanup_wal_lock(self):
-        """启动时检查并清理残留的WAL/lock文件"""
-        for suffix in ['.wal', '.lock', '.temp']:
-            stale = self.db_path.with_suffix(self.db_path.suffix + suffix)
+        """启动时检查并清理残留的WAL/lock文件
+
+        DuckDB 的 WAL 文件是 db_path.wal（如 data/astock_full.wal），
+        而不是 db_path.suffix + '.wal'（如 data/astock_full.duckdb.wal）。
+        """
+        # 正确的 DuckDB WAL/lock 路径拼接
+        for extra in ['.wal', '.lock']:
+            stale = Path(str(self.db_path) + extra)
             if stale.exists():
                 try:
                     stale.unlink()
@@ -66,11 +71,7 @@ class DuckDBStore:
 
     def __exit__(self, *args):
         self.close()
-    
-    def close(self):
-        """关闭连接"""
-        self.conn.close()
-    
+
     def init_tables(self):
         """初始化所有表"""
         sqls = [

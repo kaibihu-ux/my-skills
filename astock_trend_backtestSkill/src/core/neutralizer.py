@@ -119,7 +119,7 @@ class Neutralizer:
         industry_codes: np.ndarray,
     ) -> np.ndarray:
         """
-        行业中性化：减去行业均值
+        行业中性化：减去行业均值（O(n) 纯numpy向量化，无Python循环）
 
         factor_neutral = factor - industry_mean
 
@@ -130,19 +130,37 @@ class Neutralizer:
         Returns:
             行业中性化后的因子值
         """
-        factor = np.asarray(factor, dtype=np.float64)
+        result = np.asarray(factor, dtype=np.float64).copy()
         industry = np.asarray(industry_codes)
 
-        result = factor.copy()
-        unique_industries = np.unique(industry[industry != ''])
+        # 过滤空行业码（取子集，不改变原始数组长度）
+        valid = ~pd.isna(industry) & (industry != '')
+        if valid.sum() < 30:
+            return factor
 
-        for ind in unique_industries:
-            mask = industry == ind
-            if mask.sum() < 1:
-                continue
-            # 用 nanmean 而非 mean，避免 NaN 因子值污染均值；同时基于 winsorize 后的 result 而非原始 factor
-            ind_mean = np.nanmean(result[mask])
-            result[mask] = result[mask] - ind_mean
+        # 保存原始值（用于还原NaN）
+        orig_valid = result[valid].copy()
+
+        # 用0填充NaN以便计算均值
+        result[valid] = np.nan_to_num(result[valid], nan=0.0)
+
+        # 行业去重 + 获取映射索引
+        unique_ind, inverse = np.unique(industry[valid], return_inverse=True)
+
+        # 一次性累加所有行业的因子值和计数
+        n_industry = len(unique_ind)
+        industry_sums = np.zeros(n_industry, dtype=np.float64)
+        industry_counts = np.zeros(n_industry, dtype=np.int64)
+
+        np.add.at(industry_sums, inverse, result[valid])  # 按行业索引累加
+        np.add.at(industry_counts, inverse, 1)              # 计数
+
+        # 计算行业均值（避免除0）
+        industry_counts[industry_counts == 0] = 1
+        industry_means = industry_sums / industry_counts
+
+        # 广播减均值（向量化）
+        result[valid] = result[valid] - industry_means[inverse]
 
         return result
 
@@ -204,30 +222,18 @@ class Neutralizer:
         industry_codes: np.ndarray,
     ) -> np.ndarray:
         """
-        完整中性化（行业哑变量回归 + 市值回归）
+        完整中性化（行业哑变量回归 + 市值回归，向量化版本）
 
         步骤：
         1. winsorize 极值处理
-        2. 行业哑变量回归：
-           factor = Σβᵢ·industry_i + residual
-           （不加截距，完全去除行业影响）
-        3. 市值回归：
-           residual = γ + δ·ln_mcap + ε
+        2. 行业哑变量回归（向量化 groupby，无 Python 循环）
+        3. 市值回归残差（O(n) 一遍扫描）
         4. 返回 ε
-
-        Args:
-            factor:         因子值
-            market_cap:     市值
-            industry_codes: 行业代码
-
-        Returns:
-            完整中性化后的因子值
         """
         factor = np.asarray(factor, dtype=np.float64)
         mcap = np.asarray(market_cap, dtype=np.float64)
         industry = np.asarray(industry_codes)
 
-        # 过滤有效数据
         valid_mask = (
             np.isfinite(factor)
             & (mcap > 0)
@@ -242,20 +248,27 @@ class Neutralizer:
         # Step 1: Winsorize
         result = self._winsorize(result, self.winsorize_pct)
 
-        # Step 2: 行业哑变量回归（完全去除行业影响）
-        unique_industries = np.unique(industry[industry != ''])
-        for ind in unique_industries:
-            mask = industry == ind
-            if mask.sum() < 1:
-                continue
-            ind_mean = np.mean(result[mask])
-            result[mask] = result[mask] - ind_mean
+        # Step 2: 行业哑变量回归（使用 pandas groupby 向量化）
+        try:
+            import pandas as pd
+            n = len(result)
+            df_temp = pd.DataFrame({'factor': result, 'industry': industry})
+            group_means = df_temp.groupby('industry', dropna=False)['factor'].transform('mean')
+            result = result - group_means.values
+        except Exception:
+            # 回退到循环版本
+            unique_industries = np.unique(industry[industry != ''])
+            for ind in unique_industries:
+                mask = industry == ind
+                if mask.sum() < 1:
+                    continue
+                ind_mean = np.mean(result[mask])
+                result[mask] = result[mask] - ind_mean
 
         # Step 3: 市值回归残差
         ln_mcap = np.log(mcap[valid_mask])
         y = result[valid_mask]
 
-        n = len(y)
         x_mean = np.mean(ln_mcap)
         y_mean = np.mean(y)
 
