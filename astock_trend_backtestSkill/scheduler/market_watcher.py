@@ -16,38 +16,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.api.skill_api import get_instance
 
+# 复用 tasks.py 中的精确非交易日判断（包含完整节假日列表）
+from tasks import is_trading_day as _is_trading_day_tasks, is_market_open as _is_market_open_tasks
+
+
+# 全局单例 watcher 实例，防止重复启动线程
+_watcher_instance = None
+_watcher_lock = threading.Lock()
+
 
 def is_trading_day(d=None):
-    """判断是否为交易日（排除周末和A股重要节假日）"""
-    if d is None:
-        d = date.today()
-    # 周末
-    if d.weekday() >= 5:
-        return False
-    # 重要节假日（简化判断，可扩展为从网上抓取）
-    year = d.year
-    # 元旦
-    holidays = [
-        f"{year}0101", f"{year}0102", f"{year}0103",
-        # 春节（简化：每年正月初一前后各3天，动态计算）
-        # 清明
-        # 劳动节
-        # 端午
-        # 中秋
-        # 国庆
-    ]
-    if d.strftime('%Y%m%d') in holidays:
-        return False
-    return True
+    """判断是否为交易日（复用tasks.py完整节假日列表）"""
+    return _is_trading_day_tasks(d)
 
 
 def is_market_open(d=None):
     """判断当前是否在交易时间内"""
-    now = datetime.now()
-    if not is_trading_day(d):
-        return False
-    h, m = now.hour, now.minute
-    return (h == 9 and m >= 30) or (h == 10) or (h == 11 and m < 30) or (h == 13) or (h == 14) or (h == 15 and m < 5)
+    return _is_market_open_tasks(d)
 
 
 class MarketWatcher:
@@ -285,8 +270,12 @@ class MarketWatcher:
             print(f"[{now_str}] 大盘检查失败: {e}")
 
     def _save_alerts(self, alerts):
-        """保存预警记录"""
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        """保存预警记录
+
+        DuckDB TIMESTAMP 类型不接受字符串，必须传 Python datetime 对象。
+        """
+        now_dt = datetime.now()  # datetime 对象，用于插入 TIMESTAMP
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")  # 仅用于日志
         try:
             for alert in alerts:
                 try:
@@ -295,11 +284,11 @@ class MarketWatcher:
                         INSERT INTO alerts (alert_type, message, created_at)
                         VALUES (?, ?, ?)
                         """,
-                        [alert.get('type', ''), alert.get('message', ''), now_str]
+                        [alert.get('type', ''), alert.get('message', ''), now_dt]
                     )
-                except Exception:
-                    # 表可能不存在，跳过
-                    pass
+                except Exception as e:
+                    # 表可能不存在或结构不匹配，跳过但打印日志
+                    print(f"[{now_str}] 保存单条预警失败: {e}")
         except Exception as e:
             print(f"[{now_str}] 保存预警失败: {e}")
 
@@ -315,7 +304,13 @@ def _get_yesterday_str(today_str):
 
 
 def job_market_watcher():
-    """调度器入口：启动盘中监控（后台线程）"""
-    watcher = MarketWatcher(check_interval=1800)  # 30分钟
-    watcher.start()
-    return watcher
+    """调度器入口：启动盘中监控（单例模式，防止重复启动线程）"""
+    global _watcher_instance
+    with _watcher_lock:
+        if _watcher_instance is not None and _watcher_instance._running:
+            print(f"[{datetime.now()}] MarketWatcher 已运行，跳过重复启动")
+            return _watcher_instance
+        watcher = MarketWatcher(check_interval=1800)  # 30分钟
+        watcher.start()
+        _watcher_instance = watcher
+        return watcher
