@@ -927,7 +927,22 @@ class RLOptimizer:
     def _get_market_return(self, date: str) -> float:
         """获取截至 date 的市场指数收益率（使用缓存）"""
         if not self._market_index_cache:
-            return self._get_market_return_original(date)
+            # 缓存为空时，直接查 DuckDB
+            try:
+                idx_prices = self.backtester.store.df(
+                    f"""SELECT trade_date, close FROM stock_daily
+                        WHERE ts_code = '000001.SH'
+                        AND trade_date <= '{date}'
+                        ORDER BY trade_date DESC
+                        LIMIT {self.lookback_days}"""
+                )
+                if len(idx_prices) >= 2:
+                    ret = (float(idx_prices.iloc[0]['close']) - float(idx_prices.iloc[-1]['close'])) \
+                          / float(idx_prices.iloc[-1]['close'])
+                    return float(ret)
+            except Exception:
+                pass
+            return 0.0
         try:
             dates_sorted = sorted(self._market_index_cache.keys())
             d_idx = None

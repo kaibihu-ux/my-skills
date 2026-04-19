@@ -850,30 +850,39 @@ class BacktestExecutor:
         
         # ===== 计算每笔交易的盈亏 =====
         if trades:
-            trades_df = pd.DataFrame(trades)
-            trades_df['pnl'] = 0.0
+            # 建立 trade_id -> index 映射，直接修改原始 trades 列表
+            trade_id_to_idx = {t['trade_id']: i for i, t in enumerate(trades)}
             
-            # 按 ts_code 分组配对买卖
-            for ts_code in trades_df['ts_code'].unique():
-                code_trades = trades_df[trades_df['ts_code'] == ts_code].sort_values('trade_date')
-                buys = code_trades[code_trades['direction'] == 'buy']
-                sells = code_trades[code_trades['direction'] == 'sell']
+            # 按 ts_code 分组配对买卖（FIFO）
+            from collections import defaultdict
+            code_trades_map = defaultdict(list)
+            for t in trades:
+                code_trades_map[t['ts_code']].append(t)
+            
+            for ts_code, code_trades in code_trades_map.items():
+                code_trades = sorted(code_trades, key=lambda x: x['trade_date'])
+                buys = [t for t in code_trades if t['direction'] == 'buy']
+                sells = [t for t in code_trades if t['direction'] == 'sell']
                 
-                buy_queue = buys.to_dict('records')
-                sell_queue = sells.to_dict('records')
+                buy_queue = list(buys)
+                sell_queue = list(sells)
                 
-                # 简单 FIFO：配对买卖计算盈亏
-                for buy in buy_queue:
+                # FIFO 配对
+                while buy_queue and sell_queue:
+                    buy = buy_queue.pop(0)
+                    sell = sell_queue.pop(0)
                     buy_cost = buy['price'] * buy['quantity'] * (1 + self.slippage + self.commission)
-                    if sell_queue:
-                        sell = sell_queue.pop(0)
-                        sell_proceeds = sell['price'] * sell['quantity'] * (1 - self.slippage - self.commission)
-                        pnl = sell_proceeds - buy_cost
-                        trades_df.loc[buy['trade_id'] == trades_df['trade_id'], 'pnl'] = pnl
+                    sell_proceeds = sell['price'] * sell['quantity'] * (1 - self.slippage - self.commission)
+                    pnl = sell_proceeds - buy_cost
+                    # 更新原始 trades 列表
+                    buy_idx = trade_id_to_idx.get(buy['trade_id'])
+                    if buy_idx is not None:
+                        trades[buy_idx]['pnl'] = pnl
             
-            # 胜率
-            winning_trades = [t for t in trades if t.get('pnl', 0) > 0]
-            win_rate = len(winning_trades) / len(trades) if trades else 0
+            # 胜率（只统计有pnl的买卖对，即buy数量）
+            trades_with_pnl = [t for t in trades if 'pnl' in t]
+            winning_trades = [t for t in trades_with_pnl if t.get('pnl', 0) > 0]
+            win_rate = len(winning_trades) / len(trades_with_pnl) if trades_with_pnl else 0
         else:
             win_rate = 0
         

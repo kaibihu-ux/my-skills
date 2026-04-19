@@ -216,13 +216,23 @@ class FactorEvaluator:
             if ncfg.get('enabled', True):
                 from src.core.neutralizer import Neutralizer
                 neutralizer = Neutralizer(self.store, self.logger, self.config)
+                # 获取行业信息（ts_code -> industry 映射）
+                if 'industry' not in merged.columns:
+                    industry_df = self.store.df(
+                        "SELECT ts_code, industry FROM stock_list WHERE industry IS NOT NULL AND industry != ''"
+                    )
+                    if not industry_df.empty:
+                        merged = merged.merge(industry_df, on='ts_code', how='left')
+                        merged['industry'] = merged['industry'].fillna('Unknown')
+                    else:
+                        merged['industry'] = 'Unknown'
                 # 对每个截面的因子值做行业中性化（超时保护 60s）
                 neutralized_values, is_timeout = _timeout_call(
                     60.0,
                     merged['value'].values,  # 超时时回退为原始因子值
                     neutralizer.industry_neutralize,
                     merged['value'].values,
-                    merged['ts_code'].values,
+                    merged['industry'].values,  # 传入行业而非 ts_code
                 )
                 if is_timeout:
                     self.logger.warning(f"[{factor_name}] 中性化超时(60s)，回退原始因子值")

@@ -9,10 +9,10 @@ class PerformanceAnalyzer:
     @staticmethod
     def calc_sharpe(returns: pd.Series, risk_free_rate: float = 0.03) -> float:
         """计算夏普比率"""
+        if returns.empty or returns.std() == 0:
+            return 0.0
         excess_returns = returns - risk_free_rate / 252
-        if returns.std() == 0:
-            return 0
-        return excess_returns.mean() / returns.std() * np.sqrt(252)
+        return float(excess_returns.mean() / returns.std() * np.sqrt(252))
     
     @staticmethod
     def calc_max_drawdown(nav: pd.Series) -> float:
@@ -49,12 +49,12 @@ class PerformanceAnalyzer:
         """完整绩效分析"""
         returns = nav_series.pct_change().dropna()
         
-        # 年度收益
+        # 年度收益：每年最后一个净值 / 第一个净值 - 1
         nav_df = pd.DataFrame({'nav': nav_series})
         nav_df['year'] = pd.to_datetime(nav_df.index).year
-        annual_returns = nav_df.groupby('year')['nav'].apply(
-            lambda x: (x.iloc[-1] / x.iloc[0]) - 1 if len(x) > 1 else 0
-        )
+        yearly_first = nav_df.groupby('year')['nav'].first()
+        yearly_last = nav_df.groupby('year')['nav'].last()
+        annual_returns = (yearly_last / yearly_first - 1.0).to_dict()
         
         return {
             'total_return': (nav_series.iloc[-1] / nav_series.iloc[0]) - 1 if len(nav_series) > 0 else 0,
@@ -65,5 +65,5 @@ class PerformanceAnalyzer:
             'win_rate': self.calc_win_rate(trades),
             'profit_loss_ratio': self.calc_profit_loss_ratio(trades),
             'total_trades': len(trades),
-            'annual_returns': annual_returns.to_dict(),
+            'annual_returns': annual_returns,
         }

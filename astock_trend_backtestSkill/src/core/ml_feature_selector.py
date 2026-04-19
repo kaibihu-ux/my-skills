@@ -76,24 +76,19 @@ class MLFeatureSelector:
         self.logger.info(f"因子面板构建完成: {panel.shape}")
         return panel
 
-    def _build_label(panel: pd.DataFrame, forward_days: int = 5) -> pd.DataFrame:
+    def _build_label(self, df: pd.DataFrame, forward_days: int = 5) -> pd.DataFrame:
         """
         构建标签：未来 forward_days 日收益率分类（涨=1，跌=0）
         """
-        panel = panel.sort_values(['ts_code', 'trade_date']).copy()
+        df = df.sort_values(['ts_code', 'trade_date']).copy()
 
-        def forward_return(group):
-            group = group.sort_values('trade_date')
-            future = group['close'].shift(-forward_days)
-            ret = (future / group['close']) - 1
-            return ret
-
-        panel['future_return'] = panel.groupby('ts_code', group_keys=False).apply(forward_return)
-        panel['label'] = (panel['future_return'] > 0).astype(int)
-
-        # 过滤无效标签
-        panel = panel.dropna(subset=['label'])
-        return panel
+        # 向量化计算：按 ts_code 分组shift，得到未来收益
+        df['future_return'] = (
+            df.groupby('ts_code')['close'].shift(-forward_days) / df['close'] - 1
+        )
+        df['label'] = (df['future_return'] > 0).astype(int)
+        df = df.dropna(subset=['label'])
+        return df
 
     def select_features(
         self, factor_names: List[str], start_date: str, end_date: str
