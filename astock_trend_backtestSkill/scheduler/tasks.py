@@ -865,27 +865,79 @@ def job_data_update():
 
 
 def job_factor_pool_update():
-    """因子池更新（重新计算所有因子）"""
+    """因子池更新（重新计算所有因子，含超时保护）"""
+    return _factor_pool_update_with_timeout()
+
+
+_factor_pool_update_timeout = 6 * 3600  # 6小时超时
+
+
+def _factor_pool_update_with_timeout():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] 因子池更新任务")
-    try:
-        api = get_instance()
-        api.execute({'action': 'evaluate_factors'})
-    except Exception as e:
-        print(f"[{now}] 因子池更新失败: {e}")
+    print(f"[{now}] 因子池更新任务（超时保护: {_factor_pool_update_timeout // 3600}h）")
+    result = [None]
+    exception = [None]
+
+    def target():
+        try:
+            api = get_instance()
+            ret = api.execute({'action': 'evaluate_factors'})
+            result[0] = ret
+            if ret.get('code') == 500:
+                print(f"[{now}] 因子评估失败: {ret.get('msg')}")
+            elif ret.get('code') == 0:
+                top = ret.get('data', {}).get('top_factor')
+                count = ret.get('data', {}).get('count', 0)
+                print(f"[{now}] 因子评估完成: 评估{count}个因子, Top: {top.get('factor_name') if top else 'N/A'}")
+        except Exception as e:
+            exception[0] = e
+
+    t = threading.Thread(target=target, name='factor_pool_update')
+    t.daemon = True
+    t.start()
+    t.join(timeout=_factor_pool_update_timeout)
+    if t.is_alive():
+        print(f"[{now}] ⏰ 因子池更新运行超过 {_factor_pool_update_timeout // 3600}h，强制结束")
+        raise TimeoutError(f"job_factor_pool_update timed out after {_factor_pool_update_timeout // 3600} hours")
+    if exception[0]:
+        raise exception[0]
+    return result[0]
 
 
 def job_factor_rebalance():
-    """因子池重平衡"""
+    """因子池重平衡（含超时保护）"""
+    return _factor_rebalance_with_timeout()
+
+
+_factor_rebalance_timeout = 30 * 60  # 30分钟超时
+
+
+def _factor_rebalance_with_timeout():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] 因子池重平衡任务")
-    try:
-        api = get_instance()
-        api.factor_pool.rebalance()
-        top = api.factor_pool.get_top_factors(10)
-        print(f"[{now}] 重平衡完成，Top10: {[f['factor_name'] for f in top]}")
-    except Exception as e:
-        print(f"[{now}] 重平衡失败: {e}")
+    print(f"[{now}] 因子池重平衡任务（超时: {_factor_rebalance_timeout // 60}min）")
+    result = [None]
+    exception = [None]
+
+    def target():
+        try:
+            api = get_instance()
+            api.factor_pool.rebalance()
+            top = api.factor_pool.get_top_factors(10)
+            print(f"[{now}] 重平衡完成，Top10: {[f['factor_name'] for f in top]}")
+            result[0] = True
+        except Exception as e:
+            exception[0] = e
+
+    t = threading.Thread(target=target, name='factor_rebalance')
+    t.daemon = True
+    t.start()
+    t.join(timeout=_factor_rebalance_timeout)
+    if t.is_alive():
+        print(f"[{now}] ⏰ 因子池重平衡运行超过 {_factor_rebalance_timeout // 60}min，强制结束")
+        raise TimeoutError(f"job_factor_rebalance timed out after {_factor_rebalance_timeout // 60} minutes")
+    if exception[0]:
+        raise exception[0]
+    return result[0]
 
 
 def job_market_watcher():
