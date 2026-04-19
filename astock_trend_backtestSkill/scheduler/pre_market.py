@@ -158,5 +158,33 @@ def _build_today_action(strategies, market_outlook):
 
 
 def job_pre_market():
-    """调度器入口"""
-    return pre_market()
+    """调度器入口（含超时保护）"""
+    return _pre_market_with_timeout()
+
+
+_pre_market_timeout = 30 * 60  # 30分钟超时
+
+
+def _pre_market_with_timeout():
+    """带超时保护的盘前预判包装"""
+    import threading
+    result = [None]
+    exception = [None]
+
+    def target():
+        try:
+            result[0] = pre_market()
+        except Exception as e:
+            exception[0] = e
+
+    t = threading.Thread(target=target, name='pre_market')
+    t.daemon = True
+    t.start()
+    t.join(timeout=_pre_market_timeout)
+    if t.is_alive():
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] ⏰ pre_market 运行超过 {_pre_market_timeout // 60}min，强制结束")
+        raise TimeoutError(f"pre_market timed out after {_pre_market_timeout // 60} minutes")
+    if exception[0]:
+        raise exception[0]
+    return result[0]
