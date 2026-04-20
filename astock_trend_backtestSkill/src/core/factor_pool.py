@@ -53,24 +53,34 @@ class FactorPoolManager:
         return df.to_dict('records')
     
     def rebalance(self):
-        """因子池重平衡 - IC和IR双重淘汰"""
+        """因子池重平衡 - IC和IR双重淘汰（批量UPDATE避免N次锁竞争）"""
         df = self.store.df("SELECT * FROM factor_pool ORDER BY avg_ir DESC")
-        
-        # 淘汰条件：IC < eviction_ic 且 IR < eviction_ir
+
+        # 批量准备淘汰名单
+        evict_names = []
         for _, row in df.iterrows():
             ic = row.get('avg_ic', 0)
             ir = row.get('avg_ir', 0)
             if ic < self.eviction_ic and ir < self.eviction_ir:
-                self.store.execute(
-                    "UPDATE factor_pool SET status = 'evicted' WHERE factor_name = ?",
-                    [row['factor_name']]
-                )
+                evict_names.append(row['factor_name'])
                 self.logger.info(f"淘汰因子(低IC低IR): {row['factor_name']}, IC={ic:.4f}, IR={ir:.4f}")
-        
-        # 更新排名
-        df = self.store.df("SELECT * FROM factor_pool WHERE status = 'active' ORDER BY avg_ir DESC")
-        for i, (_, row) in enumerate(df.iterrows()):
+
+        # 批量UPDATE（一次DB写入，避免N次锁竞争）
+        if evict_names:
+            placeholders = ','.join([f"'{n}'" for n in evict_names])
             self.store.execute(
-                "UPDATE factor_pool SET rank = ? WHERE factor_name = ?",
-                [i+1, row['factor_name']]
+                f"UPDATE factor_pool SET status = 'evicted' WHERE factor_name IN ({placeholders})"
             )
+
+        # 批量更新排名（先查active，再批量UPDATE rank）
+        active_df = self.store.df("SELECT * FROM factor_pool WHERE status = 'active' ORDER BY avg_ir DESC")
+        rank_updates = []
+        for i, (_, row) in enumerate(active_df.iterrows()):
+            rank_updates.append((i + 1, row['factor_name']))
+        if rank_updates:
+            # 批量UPDATE排名
+            for rank, name in rank_updates:
+                self.store.execute(
+                    "UPDATE factor_pool SET rank = ? WHERE factor_name = ?",
+                    [rank, name]
+                )

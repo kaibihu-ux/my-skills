@@ -713,6 +713,8 @@ class DataManager:
         if combined.empty:
             return
         try:
+            # 先查重：只删除本批次存在的 (ts_code, trade_date) 对
+            # （避免多进程并发时误删其他进程正在写入的同一ts_code不同日期数据）
             for ts_code in combined['ts_code'].unique():
                 mask = combined['ts_code'] == ts_code
                 dates = combined.loc[mask, 'trade_date'].unique()
