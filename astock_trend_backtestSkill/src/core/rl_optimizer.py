@@ -49,182 +49,187 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
     # 在子进程中重建必要的数据库连接（避免 Store 对象不可 pickle）
     import duckdb
     conn = duckdb.connect(store_info)
+    try:
+        # 注意：所有子函数定义和主逻辑都在 try 块内，确保 finally 能正确关闭连接
 
-    class MiniStore:
-        def __init__(self, conn):
-            self.conn = conn
-        def df(self, sql):
-            return pd.read_sql(sql, self.conn)
+        class MiniStore:
+            def __init__(self, conn):
+                self.conn = conn
 
-    store = MiniStore(conn)
+            def df(self, sql):
+                return pd.read_sql(sql, self.conn)
 
-    # 重建因子查询函数（子进程内）
-    def get_market_return(date):
-        try:
-            idx_prices = pd.read_sql(
-                f"""SELECT trade_date, close FROM stock_daily
-                    WHERE ts_code = '000001.SH'
-                    AND trade_date <= '{date}'
-                    ORDER BY trade_date DESC
-                    LIMIT {lookback_days}""",
-                conn
-            )
-            if len(idx_prices) >= 2:
-                ret = (idx_prices.iloc[0]['close'] - idx_prices.iloc[-1]['close']) \
-                      / idx_prices.iloc[-1]['close']
-                return float(ret)
-        except Exception:
-            pass
-        return 0.0
+        store = MiniStore(conn)
 
-    def get_momentum_return(date):
-        try:
-            dt = pd.to_datetime(date)
-            start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
-            start_str = start_dt.strftime('%Y-%m-%d')
-            mom_df = pd.read_sql(
-                f"""SELECT AVG(value) as avg_mom FROM factors
-                    WHERE factor_name = 'momentum_20'
-                    AND trade_date BETWEEN '{start_str}' AND '{date}'
-                    AND value IS NOT NULL""",
-                conn
-            )
-            if not mom_df.empty and mom_df.iloc[0]['avg_mom'] is not None:
-                return float(mom_df.iloc[0]['avg_mom'])
-        except Exception:
-            pass
-        return 0.0
-
-    def get_volatility(date):
-        try:
-            dt = pd.to_datetime(date)
-            start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
-            start_str = start_dt.strftime('%Y-%m-%d')
-            vol_df = pd.read_sql(
-                f"""SELECT AVG(value) as avg_vol FROM factors
-                    WHERE factor_name = 'volatility_20'
-                    AND trade_date BETWEEN '{start_str}' AND '{date}'
-                    AND value IS NOT NULL""",
-                conn
-            )
-            if not vol_df.empty and vol_df.iloc[0]['avg_vol'] is not None:
-                return float(vol_df.iloc[0]['avg_vol'])
-        except Exception:
-            pass
-        return 0.02
-
-    ACTION_MAP = {0: 0.0, 1: 0.5, 2: 1.0}
-    N_ACTIONS = 3
-    q_table = defaultdict(lambda: [0.0, 0.0, 0.0])
-
-    def get_state(date, portfolio_value, positions, nav_history):
-        market_ret = get_market_return(date)
-        market_regime = 1 if market_ret > 0.02 else (-1 if market_ret < -0.02 else 0)
-        momentum_ret = get_momentum_return(date)
-        momentum_signal = 1 if momentum_ret > 0.01 else (-1 if momentum_ret < -0.01 else 0)
-        vol = get_volatility(date)
-        vol_signal = 1 if vol > 0.03 else (-1 if vol < 0.015 else 0)
-        return (market_regime, momentum_signal, vol_signal)
-
-    def choose_action(state, eps):
-        if random.random() < eps:
-            return random.randint(0, N_ACTIONS - 1)
-        return int(np.argmax(q_table[state]))
-
-    def update_q(state, action, reward, next_state):
-        current_q = q_table[state][action]
-        max_next_q = max(q_table[next_state]) if next_state in q_table else 0.0
-        q_table[state][action] = current_q + alpha * (reward + gamma * max_next_q - current_q)
-
-    def get_positions_value(date, positions):
-        total = 0.0
-        for ts_code, pos in positions.items():
+        # 重建因子查询函数（子进程内）
+        def get_market_return(date):
             try:
-                df = pd.read_sql(
-                    f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
+                idx_prices = pd.read_sql(
+                    f"""SELECT trade_date, close FROM stock_daily
+                        WHERE ts_code = '000001.SH'
+                        AND trade_date <= '{date}'
+                        ORDER BY trade_date DESC
+                        LIMIT {lookback_days}""",
                     conn
                 )
-                if not df.empty:
-                    total += pos['shares'] * float(df.iloc[0]['close'])
+                if len(idx_prices) >= 2:
+                    ret = (idx_prices.iloc[0]['close'] - idx_prices.iloc[-1]['close']) \
+                          / idx_prices.iloc[-1]['close']
+                    return float(ret)
             except Exception:
                 pass
-        return total
+            return 0.0
 
-    def get_close_price(ts_code, date):
-        df = pd.read_sql(
-            f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
-            conn
-        )
-        return float(df.iloc[0]['close']) if not df.empty else 0.0
+        def get_momentum_return(date):
+            try:
+                dt = pd.to_datetime(date)
+                start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
+                start_str = start_dt.strftime('%Y-%m-%d')
+                mom_df = pd.read_sql(
+                    f"""SELECT AVG(value) as avg_mom FROM factors
+                        WHERE factor_name = 'momentum_20'
+                        AND trade_date BETWEEN '{start_str}' AND '{date}'
+                        AND value IS NOT NULL""",
+                    conn
+                )
+                if not mom_df.empty and mom_df.iloc[0]['avg_mom'] is not None:
+                    return float(mom_df.iloc[0]['avg_mom'])
+            except Exception:
+                pass
+            return 0.0
 
-    def execute_with_position(date, strategy, base_params, positions, cash, position_ratio):
-        # 简化版选股信号（基于动量排名前N）
-        signals = []
-        try:
-            factor_df = pd.read_sql(
-                f"""SELECT ts_code, value FROM factors
-                    WHERE factor_name = 'momentum_20'
-                    AND trade_date = '{date}'
-                    AND value IS NOT NULL
-                    ORDER BY value DESC LIMIT 20""",
+        def get_volatility(date):
+            try:
+                dt = pd.to_datetime(date)
+                start_dt = dt - pd.Timedelta(days=int(lookback_days * 1.5))
+                start_str = start_dt.strftime('%Y-%m-%d')
+                vol_df = pd.read_sql(
+                    f"""SELECT AVG(value) as avg_vol FROM factors
+                        WHERE factor_name = 'volatility_20'
+                        AND trade_date BETWEEN '{start_str}' AND '{date}'
+                        AND value IS NOT NULL""",
+                    conn
+                )
+                if not vol_df.empty and vol_df.iloc[0]['avg_vol'] is not None:
+                    return float(vol_df.iloc[0]['avg_vol'])
+            except Exception:
+                pass
+            return 0.02
+
+        ACTION_MAP = {0: 0.0, 1: 0.5, 2: 1.0}
+        N_ACTIONS = 3
+        q_table = defaultdict(lambda: [0.0, 0.0, 0.0])
+
+        def get_state(date, portfolio_value, positions, nav_history):
+            market_ret = get_market_return(date)
+            market_regime = 1 if market_ret > 0.02 else (-1 if market_ret < -0.02 else 0)
+            momentum_ret = get_momentum_return(date)
+            momentum_signal = 1 if momentum_ret > 0.01 else (-1 if momentum_ret < -0.01 else 0)
+            vol = get_volatility(date)
+            vol_signal = 1 if vol > 0.03 else (-1 if vol < 0.015 else 0)
+            return (market_regime, momentum_signal, vol_signal)
+
+        def choose_action(state, eps):
+            if random.random() < eps:
+                return random.randint(0, N_ACTIONS - 1)
+            return int(np.argmax(q_table[state]))
+
+        def update_q(state, action, reward, next_state):
+            current_q = q_table[state][action]
+            max_next_q = max(q_table[next_state]) if next_state in q_table else 0.0
+            q_table[state][action] = current_q + alpha * (reward + gamma * max_next_q - current_q)
+
+        def get_positions_value(date, positions):
+            total = 0.0
+            for ts_code, pos in positions.items():
+                try:
+                    df = pd.read_sql(
+                        f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
+                        conn
+                    )
+                    if not df.empty:
+                        total += pos['shares'] * float(df.iloc[0]['close'])
+                except Exception:
+                    pass
+            return total
+
+        def get_close_price(ts_code, date):
+            df = pd.read_sql(
+                f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
                 conn
             )
-            if not factor_df.empty:
-                for _, row in factor_df.head(5).iterrows():
-                    price = get_close_price(row['ts_code'], date)
-                    if price > 0:
-                        signals.append({'ts_code': row['ts_code'], 'direction': 'buy', 'price': price})
-        except Exception:
-            pass
+            return float(df.iloc[0]['close']) if not df.empty else 0.0
 
-        for signal in signals:
-            ts_code = signal['ts_code']
-            direction = signal['direction']
-            price = signal['price']
-            if direction == 'buy' and cash > 0:
-                invest_amount = cash * position_ratio
-                shares = int(invest_amount * 0.1 / (price * (1 + slippage)))
-                if shares > 0:
-                    cost = shares * price * (1 + slippage + commission)
-                    cash -= cost
-                    positions[ts_code] = {'shares': shares, 'cost': price}
-            elif direction == 'sell' and ts_code in positions:
-                pos = positions[ts_code]
-                proceeds = pos['shares'] * price * (1 - slippage - commission)
-                cash += proceeds
-                del positions[ts_code]
-        return cash, positions
+        def execute_with_position(date, strategy, base_params, positions, cash, position_ratio):
+            # 简化版选股信号（基于动量排名前N）
+            signals = []
+            try:
+                factor_df = pd.read_sql(
+                    f"""SELECT ts_code, value FROM factors
+                        WHERE factor_name = 'momentum_20'
+                        AND trade_date = '{date}'
+                        AND value IS NOT NULL
+                        ORDER BY value DESC LIMIT 20""",
+                    conn
+                )
+                if not factor_df.empty:
+                    for _, row in factor_df.head(5).iterrows():
+                        price = get_close_price(row['ts_code'], date)
+                        if price > 0:
+                            signals.append({'ts_code': row['ts_code'], 'direction': 'buy', 'price': price})
+            except Exception:
+                pass
 
-    # ---- 运行单个 episode ----
-    cash = initial_cash
-    positions = {}
-    nav_history = []
-    episode_reward = 0.0
-    actions_taken = []
+            for signal in signals:
+                ts_code = signal['ts_code']
+                direction = signal['direction']
+                price = signal['price']
+                if direction == 'buy' and cash > 0:
+                    invest_amount = cash * position_ratio
+                    shares = int(invest_amount * 0.1 / (price * (1 + slippage)))
+                    if shares > 0:
+                        cost = shares * price * (1 + slippage + commission)
+                        cash -= cost
+                        positions[ts_code] = {'shares': shares, 'cost': price}
+                elif direction == 'sell' and ts_code in positions:
+                    pos = positions[ts_code]
+                    proceeds = pos['shares'] * price * (1 - slippage - commission)
+                    cash += proceeds
+                    del positions[ts_code]
+            return cash, positions
 
-    for i, date in enumerate(trade_dates):
-        state = get_state(date, cash, positions, nav_history)
-        action_idx = choose_action(state, epsilon)
-        actions_taken.append(action_idx)
-        position_ratio = ACTION_MAP[action_idx]
+        # ---- 运行单个 episode ----
+        cash = initial_cash
+        positions = {}
+        nav_history = []
+        episode_reward = 0.0
+        actions_taken = []
 
-        cash, positions = execute_with_position(
-            date, strategy, base_params, positions, cash, position_ratio
-        )
+        for i, date in enumerate(trade_dates):
+            state = get_state(date, cash, positions, nav_history)
+            action_idx = choose_action(state, epsilon)
+            actions_taken.append(action_idx)
+            position_ratio = ACTION_MAP[action_idx]
 
-        portfolio_value = cash + get_positions_value(date, positions)
-        next_date = trade_dates[i + 1] if i + 1 < len(trade_dates) else date
-        next_state = get_state(next_date, cash, positions, nav_history)
+            cash, positions = execute_with_position(
+                date, strategy, base_params, positions, cash, position_ratio
+            )
 
-        old_nav = nav_history[-1] if nav_history else initial_cash
-        new_nav = portfolio_value
-        reward = float(np.log(new_nav / old_nav)) if old_nav > 0 else 0.0
+            portfolio_value = cash + get_positions_value(date, positions)
+            next_date = trade_dates[i + 1] if i + 1 < len(trade_dates) else date
+            next_state = get_state(next_date, cash, positions, nav_history)
 
-        update_q(state, action_idx, reward, next_state)
-        nav_history.append(new_nav)
-        episode_reward += reward
+            old_nav = nav_history[-1] if nav_history else initial_cash
+            new_nav = portfolio_value
+            reward = float(np.log(new_nav / old_nav)) if old_nav > 0 else 0.0
 
-    conn.close()
+            update_q(state, action_idx, reward, next_state)
+            nav_history.append(new_nav)
+            episode_reward += reward
+
+    finally:
+        # 确保 DuckDB 连接始终被关闭（即使中途异常退出）
+        conn.close()
 
     return episode_reward, actions_taken, dict(q_table)
 

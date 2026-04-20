@@ -204,7 +204,15 @@ class GeneticOptimizer:
                 self._current_best_chrom = population[best_idx]
                 self._current_best_decoded = decoded
 
-            self._save_checkpoint(force=True)
+            # 修复P2：每代强制写盘改为智能保存（每5代或有新最优时保存）
+            should_save = (
+                best_fitness > self._current_best_sharpe  # 有新最优
+                or gen % 5 == 0  # 每5代定期保存
+                or gen == _resume_from  # 首代
+                or gen == _resume_from + n_gens_to_run - 1  # 末代
+            )
+            if should_save:
+                self._save_checkpoint(force=True)
 
             if timeout_checker and timeout_checker():
                 self.logger.info(f"[GA] 超时退出 Gen={gen}")

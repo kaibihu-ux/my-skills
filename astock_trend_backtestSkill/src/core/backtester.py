@@ -163,7 +163,7 @@ class BacktestExecutor:
         start_time = time.time()
         
         conn = self.store.conn
-        
+
         # 检查是否已有因子数据
         try:
             count = self.store.df(
@@ -172,113 +172,114 @@ class BacktestExecutor:
             if count > 10000:
                 self.logger.info(f"因子已存在 (momentum_20: {count} 条)，跳过计算")
                 return
-            else:
-                # 清空旧数据重新计算
-                conn.execute("DELETE FROM factors WHERE factor_name = 'momentum_20'")
-                conn.execute("DELETE FROM factors WHERE factor_name LIKE 'momentum_%'")
-                conn.execute("DELETE FROM factors WHERE factor_name = 'volatility_20'")
-                conn.execute("DELETE FROM factors WHERE factor_name = 'volume_ratio_20'")
-                self.logger.info("已清空旧因子数据，重新计算")
         except Exception:
             pass
-        
+
         self.logger.info("开始使用 SQL 计算基础因子...")
-        
-        # ===== 1. 计算动量因子 (SQL 窗口函数，使用 CTE) =====
-        for period in [5, 10, 20, 60]:
-            sql = f"""
-            WITH price_lagged AS (
-                SELECT 
+
+        # 使用显式事务包装所有因子插入，保证原子性（修复P2：避免部分插入导致数据不一致）
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            # 清空旧数据
+            conn.execute("DELETE FROM factors WHERE factor_name LIKE 'momentum_%%'")
+            conn.execute("DELETE FROM factors WHERE factor_name = 'volatility_20'")
+            conn.execute("DELETE FROM factors WHERE factor_name = 'volume_ratio_20'")
+            self.logger.info("已清空旧因子数据，重新计算")
+
+            # ===== 1. 计算动量因子 (SQL 窗口函数，使用 CTE) =====
+            for period in [5, 10, 20, 60]:
+                sql = f"""
+                WITH price_lagged AS (
+                    SELECT
+                        ts_code,
+                        trade_date,
+                        close,
+                        LAG(close, {period}) OVER (
+                            PARTITION BY ts_code
+                            ORDER BY trade_date
+                        ) as lag_close
+                    FROM stock_daily
+                )
+                INSERT INTO factors (factor_name, ts_code, trade_date, value)
+                SELECT
+                    'momentum_{period}' as factor_name,
+                    ts_code,
+                    trade_date,
+                    (close - lag_close) / lag_close as value
+                FROM price_lagged
+                WHERE lag_close IS NOT NULL
+                  AND lag_close > 0
+                  AND ABS((close - lag_close) / lag_close) < 10
+                """
+                conn.execute(sql)
+                self.logger.info(f"momentum_{period} 计算完成")
+
+            # ===== 2. 计算波动率因子 =====
+            sql_vol = """
+            WITH daily_returns_cte AS (
+                SELECT
                     ts_code,
                     trade_date,
                     close,
-                    LAG(close, {period}) OVER (
-                        PARTITION BY ts_code 
-                        ORDER BY trade_date
-                    ) as lag_close
+                    (close - LAG(close, 1) OVER (PARTITION BY ts_code ORDER BY trade_date))
+                        / LAG(close, 1) OVER (PARTITION BY ts_code ORDER BY trade_date) as daily_return
                 FROM stock_daily
+            ),
+            volatility_cte AS (
+                SELECT
+                    ts_code,
+                    trade_date,
+                    STDDEV_POP(daily_return) OVER (
+                        PARTITION BY ts_code
+                        ORDER BY trade_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) as std_dev
+                FROM daily_returns_cte
             )
             INSERT INTO factors (factor_name, ts_code, trade_date, value)
-            SELECT 
-                'momentum_{period}' as factor_name,
-                ts_code,
-                trade_date,
-                (close - lag_close) / lag_close as value
-            FROM price_lagged
-            WHERE lag_close IS NOT NULL 
-              AND lag_close > 0
-              AND ABS((close - lag_close) / lag_close) < 10
-            """
-            try:
-                conn.execute(sql)
-                self.logger.info(f"momentum_{period} 计算完成")
-            except Exception as e:
-                self.logger.error(f"momentum_{period} 计算失败: {e}")
-        
-        # ===== 2. 计算波动率因子 =====
-        sql_vol = """
-        WITH daily_returns_cte AS (
-            SELECT 
-                ts_code,
-                trade_date,
-                close,
-                (close - LAG(close, 1) OVER (PARTITION BY ts_code ORDER BY trade_date)) 
-                    / LAG(close, 1) OVER (PARTITION BY ts_code ORDER BY trade_date) as daily_return
-            FROM stock_daily
-        ),
-        volatility_cte AS (
             SELECT
+                'volatility_20' as factor_name,
                 ts_code,
                 trade_date,
-                STDDEV_POP(daily_return) OVER (
-                    PARTITION BY ts_code 
-                    ORDER BY trade_date
-                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                ) as std_dev
-            FROM daily_returns_cte
-        )
-        INSERT INTO factors (factor_name, ts_code, trade_date, value)
-        SELECT 
-            'volatility_20' as factor_name,
-            ts_code,
-            trade_date,
-            std_dev as value
-        FROM volatility_cte
-        WHERE std_dev IS NOT NULL AND std_dev < 5
-        """
-        try:
+                std_dev as value
+            FROM volatility_cte
+            WHERE std_dev IS NOT NULL AND std_dev < 5
+            """
             conn.execute(sql_vol)
             self.logger.info("volatility_20 计算完成")
-        except Exception as e:
-            self.logger.error(f"volatility_20 计算失败: {e}")
-        
-        # ===== 3. 计算量比因子 =====
-        sql_vol_ratio = """
-        INSERT INTO factors (factor_name, ts_code, trade_date, value)
-        SELECT 
-            'volume_ratio_20' as factor_name,
-            ts_code,
-            trade_date,
-            vol / avg_vol_20 as value
-        FROM (
-            SELECT 
+
+            # ===== 3. 计算量比因子 =====
+            sql_vol_ratio = """
+            INSERT INTO factors (factor_name, ts_code, trade_date, value)
+            SELECT
+                'volume_ratio_20' as factor_name,
                 ts_code,
                 trade_date,
-                vol,
-                AVG(vol) OVER (
-                    PARTITION BY ts_code 
-                    ORDER BY trade_date
-                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                ) as avg_vol_20
-            FROM stock_daily
-        ) t
-        WHERE avg_vol_20 IS NOT NULL AND avg_vol_20 > 0 AND vol / avg_vol_20 < 100
-        """
-        try:
+                vol / avg_vol_20 as value
+            FROM (
+                SELECT
+                    ts_code,
+                    trade_date,
+                    vol,
+                    AVG(vol) OVER (
+                        PARTITION BY ts_code
+                        ORDER BY trade_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) as avg_vol_20
+                FROM stock_daily
+            ) t
+            WHERE avg_vol_20 IS NOT NULL AND avg_vol_20 > 0 AND vol / avg_vol_20 < 100
+            """
             conn.execute(sql_vol_ratio)
             self.logger.info("volume_ratio_20 计算完成")
+
+            conn.execute("COMMIT")
         except Exception as e:
-            self.logger.error(f"volume_ratio_20 计算失败: {e}")
+            self.logger.error(f"因子批量计算失败，执行回滚: {e}")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
         
         # 统计
         try:
@@ -377,9 +378,23 @@ class BacktestExecutor:
                         if close_p > 0:
                             portfolio_value += pos['shares'] * close_p
 
-                    # 仓位权重分配
+                    # 仓位权重分配（修复：weight_scheme 应对所有候选股票生效，包括新买入）
                     n_target_stocks = self.top_n
-                    if target_weights and ts_code in target_weights:
+                    if weight_scheme != 'equal' and weight_scheme in ('ic_weighted', 'volatility_inverse'):
+                        # 从信号中获取该候选的因子权重（由 _get_signals 编码）
+                        ic_w = signal.get('ic_weight', 0.0)
+                        vol_w = signal.get('vol_weight', 0.0)
+                        if weight_scheme == 'ic_weighted':
+                            candidate_w = max(ic_w, 1e-10)
+                        else:  # volatility_inverse
+                            candidate_w = 1.0 / max(vol_w + 1e-8, 1e-8)
+                        # 与现有持仓合并归一化
+                        total_w = sum(target_weights.values()) + candidate_w
+                        if total_w > 0:
+                            target_pct = candidate_w / total_w
+                        else:
+                            target_pct = 1.0 / max(1, n_target_stocks)
+                    elif target_weights and ts_code in target_weights:
                         # 按权重分配（该股票应占总权益的比例）
                         target_pct = target_weights[ts_code] / max(1, len(target_weights))
                     else:
@@ -702,6 +717,9 @@ class BacktestExecutor:
         merged = merged.dropna(subset=rank_cols)
         merged = merged.sort_values('composite_score', ascending=False).reset_index(drop=True)
 
+        # 显式添加排名列（reset_index 后 index=0 是最优，index 即为排名）
+        merged['composite_rank'] = merged.index
+
         # ===== 步骤4：处理持仓股票（止损/止盈/排名淘汰）=====
         stop_loss = params.get('stop_loss', 0.05)
         take_profit = params.get('take_profit', 0.20)
@@ -730,7 +748,12 @@ class BacktestExecutor:
             row = row_data.iloc[0]
             current_price = row['close']
             current_score = row['composite_score']
-            current_rank = row.name  # composite_score 排名（0=最好）
+            # 使用显式 composite_rank 列获取真实排名（修复：row.name 在 reset_index 后才正确，但持仓股需重新查表）
+            holding_rank_row = merged[merged['ts_code'] == ts_code]
+            if len(holding_rank_row) > 0:
+                current_rank = int(holding_rank_row.iloc[0]['composite_rank'])
+            else:
+                current_rank = 0  # 不在候选池中视为 rank=0（会被排名淘汰规则卖出）
             entry_score = current_holdings.get(ts_code, {}).get('entry_score', 1.0)
 
             pnl_pct = (current_price - cost) / cost
@@ -793,17 +816,23 @@ class BacktestExecutor:
                     price = row['close']
                     if price <= 0:
                         continue
-                    # 不在这里计算shares，由run()方法根据weight_scheme统一计算
+                    buy_rank = int(row['composite_rank'])  # 使用显式排名列
+                    # 将候选股票的因子权重信息编码到信号中，供 run() 的 weight_scheme 使用
+                    ic_weight = self._factor_cache.get(('momentum_20', row['ts_code'], date_str), 0.0)
+                    vol_weight = self._factor_cache.get(('volatility_20', row['ts_code'], date_str), 0.0)
                     signals.append({
                         'ts_code': row['ts_code'],
                         'direction': 'buy',
                         'price': price,
-                        'shares': 0,  # 由run()根据weight_scheme计算
-                        'reason': f'composite_top({row.name})'
+                        'shares': 0,
+                        'reason': f'composite_top({buy_rank})',
+                        'ic_weight': ic_weight,
+                        'vol_weight': vol_weight,
+                        'composite_rank': buy_rank,
                     })
                     current_holdings[row['ts_code']] = {
                         'entry_score': row['composite_score'],
-                        'entry_rank': row.name
+                        'entry_rank': buy_rank
                     }
 
         return signals
@@ -867,17 +896,30 @@ class BacktestExecutor:
                 buy_queue = list(buys)
                 sell_queue = list(sells)
                 
-                # FIFO 配对
-                while buy_queue and sell_queue:
-                    buy = buy_queue.pop(0)
-                    sell = sell_queue.pop(0)
-                    buy_cost = buy['price'] * buy['quantity'] * (1 + self.slippage + self.commission)
-                    sell_proceeds = sell['price'] * sell['quantity'] * (1 - self.slippage - self.commission)
-                    pnl = sell_proceeds - buy_cost
-                    # 更新原始 trades 列表
-                    buy_idx = trade_id_to_idx.get(buy['trade_id'])
-                    if buy_idx is not None:
-                        trades[buy_idx]['pnl'] = pnl
+                # FIFO 配对（修复：支持部分成交，按数量比例分配成本/收益）
+                # 用 dict 记录每笔买入的剩余未匹配数量
+                from collections import OrderedDict
+                buy_remain = OrderedDict()
+                for b in buys:
+                    buy_remain[b['trade_id']] = {'trade': b, 'qty': b['quantity']}
+
+                for sell in sells:
+                    sell_qty = sell['quantity']
+                    while sell_qty > 0 and buy_remain:
+                        oldest_buy_id, buy_info = next(iter(buy_remain.items()))
+                        buy = buy_info['trade']
+                        match_qty = min(sell_qty, buy_info['qty'])
+                        buy_cost = buy['price'] * match_qty * (1 + self.slippage + self.commission)
+                        sell_proceeds = sell['price'] * match_qty * (1 - self.slippage - self.commission)
+                        pnl = sell_proceeds - buy_cost
+                        buy_idx = trade_id_to_idx.get(buy['trade_id'])
+                        if buy_idx is not None:
+                            existing_pnl = trades[buy_idx].get('pnl', 0.0)
+                            trades[buy_idx]['pnl'] = existing_pnl + pnl
+                        buy_info['qty'] -= match_qty
+                        if buy_info['qty'] <= 0:
+                            buy_remain.pop(oldest_buy_id)
+                        sell_qty -= match_qty
             
             # 胜率（只统计有pnl的买卖对，即buy数量）
             trades_with_pnl = [t for t in trades if 'pnl' in t]

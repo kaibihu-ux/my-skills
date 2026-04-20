@@ -16,17 +16,20 @@ from typing import List, Dict, Optional
 def _norm_cdf(x: np.ndarray) -> np.ndarray:
     """
     标准正态分布 CDF。
-    Φ(x) = 0.5 * erfc(-x/√2)，使用 math.erfc（Python 标准库）。
-    对数组使用逐元素计算。
+    优先使用 scipy.special.erfc（向量化，高性能），
+    无 scipy 时降级为 numpy vectorize。
     """
-    import math as _math
     x = np.asarray(x, dtype=np.float64)
     sqrty = 1.0 / np.sqrt(2.0)
-    # 逐元素计算：0.5 * erfc(-x / sqrt(2))
-    result = np.empty_like(x, dtype=np.float64)
-    for i, val in enumerate(x.flat):
-        result.flat[i] = 0.5 * _math.erfc(-val * sqrty)
-    return result
+    try:
+        from scipy.special import erfc as _erfc
+        # scipy.special.erfc 天然向量化，直接用
+        return 0.5 * _erfc(-x * sqrty)
+    except ImportError:
+        # 降级：numpy vectorize（仍然比逐元素 Python 循环快）
+        import math as _math
+        _erfc_scalar = lambda val: 0.5 * _math.erfc(-val * sqrty)
+        return np.vectorize(_erfc_scalar, otypes=[np.float64])(x)
 
 
 def _norm_ppf(q: float) -> float:
