@@ -236,6 +236,9 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
     finally:
         # 确保 DuckDB 连接始终被关闭（即使中途异常退出）
         conn.close()
+        # 从缓存移除，避免进程生命周期内连接持续累积
+        if store_info in _WORKER_CONN_CACHE:
+            del _WORKER_CONN_CACHE[store_info]
 
     return episode_reward, actions_taken, dict(q_table)
 

@@ -40,30 +40,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # ===== 交易日判断工具 =====
 from datetime import date as _date
+# 【S-005 Fix】统一从共享日历模块导入，消除与 tasks.py 的非交易日列表不一致
+from scheduler.trading_calendar import NON_TRADING_DAYS_2026 as _NON_TRADING_DAYS_2026
 
 
-# 2026年A股非交易日（周末 + 法定节假日）
+# 调休上班日（周末但当交易日），优先级最高，单独维护
 _TRADING_DAYS_EXCEPTIONAL = {
-    # 调休上班日（周末但当交易日），优先级最高
     '20260228',  # 周六调休上班
     '20260301',  # 周日调休上班
-}
-
-_NON_TRADING_DAYS_2026 = {
-    # 元旦（1月1日）
-    '20260101',
-    # 春节（2月17日-23日）
-    '20260217', '20260218', '20260219', '20260220', '20260221', '20260222', '20260223',
-    # 清明节（4月4日-6日）
-    '20260404', '20260405', '20260406',
-    # 劳动节（5月1日-5日）
-    '20260501', '20260502', '20260503', '20260504', '20260505',
-    # 端午节（6月19日-21日）
-    '20260619', '20260620', '20260621',
-    # 中秋节（9月25日-27日）
-    '20260925', '20260926', '20260927',
-    # 国庆节（10月1日-7日）
-    '20261001', '20261002', '20261003', '20261004', '20261005', '20261006', '20261007',
 }
 
 
@@ -75,7 +59,7 @@ def is_trading_day(d=None):
     # 调休上班日优先
     if date_str in _TRADING_DAYS_EXCEPTIONAL:
         return True
-    # 排除节假日
+    # 排除节假日（统一来自 trading_calendar.py，与 tasks.py 保持一致）
     if date_str in _NON_TRADING_DAYS_2026:
         return False
     # 排除周六、周日
@@ -879,7 +863,15 @@ def job_step2_ga(force_restart=False, batch_id=None, trading_day=False, generati
     cron_safe = CronSafeTimeout(
         cron_timeout_seconds=80 * 60,
         warning_pct=1.0,
-        checkpoint_fn=None,
+        checkpoint_fn=lambda: save_ckpt('step2_ga', 'step2_ga', {
+            'ga_result': {
+                'best_sharpe': ga_opt._current_best_sharpe,
+                'best_factors': ga_opt._current_best_decoded.get('factors', []) if hasattr(ga_opt, '_current_best_decoded') else [],
+                'best_params': ga_opt._current_best_decoded.get('params', {}) if hasattr(ga_opt, '_current_best_decoded') else {},
+            },
+            'generation': ga_opt._current_generation if hasattr(ga_opt, '_current_generation') else len(ga_opt._fitness_history),
+            'fitness_history': ga_opt._fitness_history if hasattr(ga_opt, '_fitness_history') else [],
+        }),
         step_name=f'Step2-GA-{batch_label}'
     )
     def _timeout_check():

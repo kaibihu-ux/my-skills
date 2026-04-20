@@ -547,8 +547,8 @@ def main():
                 continue
 
             # DuckDB bulk insert：注册临时表 + INSERT ... SELECT
+            tbl = f'fb_{i}'
             try:
-                tbl = f'fb_{i}'
                 store.conn.register(tbl, out)
                 store.conn.execute(
                     f"INSERT INTO factors (factor_name, ts_code, trade_date, value, zscore) "
@@ -556,13 +556,8 @@ def main():
                     f"FROM {tbl} "
                     f"ON CONFLICT (factor_name, ts_code, trade_date) DO NOTHING"
                 )
-                store.conn.unregister(tbl)
                 written += len(out)
             except Exception as e1:
-                try:
-                    store.conn.unregister(tbl)
-                except Exception:
-                    pass
                 # 兜底：逐行 INSERT
                 for _, r in out.iterrows():
                     try:
@@ -575,6 +570,12 @@ def main():
                         written += 1
                     except Exception:
                         pass
+            finally:
+                # 必须清理临时表，避免残留影响后续注册
+                try:
+                    store.conn.unregister(tbl)
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"[WARN] ts_code={ts_code} error: {e}", flush=True)

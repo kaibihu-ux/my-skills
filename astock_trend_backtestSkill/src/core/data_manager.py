@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List
 import multiprocessing as mp
+from filelock import FileLock
 
 from .stock_pool import AShareMainBoardFilter
 
@@ -572,7 +573,7 @@ class DataManager:
         except Exception:
             return None
 
-    def update_daily(self, start_date: str, end_date: str, max_workers: int = 8, sync_stock_list: bool = True, force: bool = False) -> int:
+    def update_daily(self, start_date: str, end_date: str, max_workers: int = 2, sync_stock_list: bool = True, force: bool = False) -> int:
         """更新日线数据（多进程并行获取，每个进程独立连接）
 
         注意：区间更新（start_date != end_date）使用 baostock 多日模式；
@@ -632,7 +633,7 @@ class DataManager:
         self.logger.info(f"日线更新完成，成功: {success_count}/{total} 只股票")
         return success_count
 
-    def _update_daily_curl(self, trade_date: str, max_workers: int = 8, force: bool = False) -> int:
+    def _update_daily_curl(self, trade_date: str, max_workers: int = 2, force: bool = False) -> int:
         """单日增量更新：bs.query_all_stock基准 + 五链路curl备援 + 进程并行"""
         self.logger.info(f"单日增量更新 {trade_date} (bs基准, 五链路备援, workers={max_workers})")
 
@@ -706,23 +707,26 @@ class DataManager:
         return success_count
 
     def _flush_daily(self, dfs: List[pd.DataFrame]):
-        """批量写入日线数据"""
+        """批量写入日线数据（带文件锁，防止多进程并发写入冲突）"""
         if not dfs:
             return
         combined = pd.concat(dfs, ignore_index=True)
         if combined.empty:
             return
+        # 【P0-005/P0-010 Fix】多进程并发写入必须有文件锁保护，防止 DuckDB 锁冲突
+        lock_path = str(self.store.db_path) + '.lock'
+        lock = FileLock(lock_path, timeout=60)
         try:
-            # 先查重：只删除本批次存在的 (ts_code, trade_date) 对
-            # （避免多进程并发时误删其他进程正在写入的同一ts_code不同日期数据）
-            for ts_code in combined['ts_code'].unique():
-                mask = combined['ts_code'] == ts_code
-                dates = combined.loc[mask, 'trade_date'].unique()
-                for td in dates:
-                    self.store.conn.execute(
-                        f"DELETE FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{td}'"
-                    )
-            self.store.conn.execute("INSERT INTO stock_daily BY NAME SELECT * FROM combined")
+            with lock:
+                # 先查重：只删除本批次存在的 (ts_code, trade_date) 对
+                for ts_code in combined['ts_code'].unique():
+                    mask = combined['ts_code'] == ts_code
+                    dates = combined.loc[mask, 'trade_date'].unique()
+                    for td in dates:
+                        self.store.conn.execute(
+                            f"DELETE FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{td}'"
+                        )
+                self.store.conn.execute("INSERT INTO stock_daily BY NAME SELECT * FROM combined")
         except Exception as e:
             self.logger.error(f"写入日线数据失败: {e}")
 

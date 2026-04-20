@@ -5,7 +5,12 @@ from pathlib import Path
 
 
 class DuckDBStore:
-    """DuckDB数据存储类（线程安全）"""
+    """DuckDB数据存储类
+    
+    注意：DuckDB 连接对象并非线程安全。本类使用 RLock 保护连接访问，
+    但多线程共享同一连接仍可能在 C++ 底层引发 race condition。
+    推荐做法：每线程独立创建连接，或使用连接池。
+    """
     
     def __init__(self, db_path: str = "data/astock_full.duckdb"):
         self.db_path = Path(db_path)
