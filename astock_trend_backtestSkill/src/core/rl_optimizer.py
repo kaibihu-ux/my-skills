@@ -6,6 +6,7 @@
 import random
 import json
 import threading
+import duckdb
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
@@ -24,6 +25,8 @@ except ImportError:
 
 # ------------------------------------------------------------------
 # 模块级 Worker 函数（用于 ProcessPoolExecutor，必须可 pickle）
+# 进程内连接缓存：避免每个episode都重新连接DuckDB
+_WORKER_CONN_CACHE: Dict[str, duckdb.DuckDBPyConnection] = {}
 # ------------------------------------------------------------------
 
 def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
@@ -46,9 +49,12 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
         slippage,
     ) = args
 
-    # 在子进程中重建必要的数据库连接（避免 Store 对象不可 pickle）
-    import duckdb
-    conn = duckdb.connect(store_info)
+    # 使用进程内连接缓存（同进程多个episode复用同一连接，避免重复创建）
+    global _WORKER_CONN_CACHE
+    if store_info not in _WORKER_CONN_CACHE:
+        _WORKER_CONN_CACHE[store_info] = duckdb.connect(store_info)
+    conn = _WORKER_CONN_CACHE[store_info]
+
     try:
         # 注意：所有子函数定义和主逻辑都在 try 块内，确保 finally 能正确关闭连接
 

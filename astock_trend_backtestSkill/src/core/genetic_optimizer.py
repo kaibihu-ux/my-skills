@@ -3,6 +3,8 @@
 不依赖 tensorflow/pytorch，纯 Python + numpy 实现
 """
 
+import os
+
 import numpy as np
 import random
 import json
@@ -369,11 +371,12 @@ class GeneticOptimizer:
                 'total_target': getattr(self, '_total_target', self.n_generations),
                 'population': getattr(self, '_current_population', []),
             }
+            # os.replace 跨文件系统也能原子覆盖（比 rename 更安全）
             tmp = str(self._checkpoint_path) + '.tmp'
             self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, 'w') as f:
                 json.dump(ckpt, f, default=str)
-            Path(tmp).rename(self._checkpoint_path)
+            os.replace(tmp, self._checkpoint_path)
 
     def _init_population(self, initial_pop: List[Dict] = None) -> List[List]:
         """初始化种群"""
@@ -543,13 +546,21 @@ class GeneticOptimizer:
         offsprings: List[List],
         elite_ratio: float,
     ) -> List:
-        """精英保留：将最优个体直接复制到下一代"""
+        """精英保留：将最优个体直接复制到下一代（优化：避免重复_evaluate）"""
         n_elite = max(1, int(len(population) * elite_ratio))
 
+        # 缓存已在父代评估过的个体适应度（用于精英选择）
+        parent_fitness_map = {tuple(ch): fitness_scores[i]
+                             for i, ch in enumerate(population)}
+
+        # 批量评估子代（只评估一次，避免重复计算）
+        offspring_fitness = [self._evaluate(ch) for ch in offsprings]
+        offspring_fitness_map = {tuple(offsprings[i]): offspring_fitness[i]
+                                for i in range(len(offsprings))}
+
         # 合并父代和子代
-        combined = list(zip(population, fitness_scores)) + list(
-            zip(offsprings, [self._evaluate(ch) for ch in offsprings])
-        )
+        combined = (list(zip(population, fitness_scores)) +
+                   list(zip(offsprings, offspring_fitness)))
         combined.sort(key=lambda x: x[1], reverse=True)
 
         new_pop = [chrom for chrom, _ in combined[:n_elite]]
