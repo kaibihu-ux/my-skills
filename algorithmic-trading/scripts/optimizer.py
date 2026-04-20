@@ -417,10 +417,21 @@ class ParameterOptimizer:
                             for i in batch_idx
                         ]
                     else:
-                        print(f"\n❌ 进程池崩溃次数过多，跳过本批次")
-                        # 标记本批次已尝试但失败，继续下一个批次
+                        print(f"\n❌ 进程池崩溃次数过多，将本批次记为失败并保存，稍后重试")
+                        # 【P0-008 Fix】不应标记为完成（会丢结果），应写入 failed 列表
                         for i in batch_idx:
-                            completed_idx.add(i)  # 跳过，避免卡在此处
+                            completed_idx.add(i)  # 仍标记为已处理，避免重复跑
+                        # 保存失败批次参数到单独文件，供下次专门重跑
+                        failed_params_path = str(checkpoint_path).replace('_ckpt.json', '_failed.json')
+                        failed_params = {
+                            'params': [params_list[i] for i in batch_idx],
+                            'batch_start': batch_start,
+                            'batch_size': len(batch_idx),
+                            'saved_at': datetime.now().isoformat(),
+                        }
+                        with open(failed_params_path, 'w', encoding='utf-8') as f:
+                            json.dump(failed_params, f, ensure_ascii=False)
+                        print(f"  💾 失败参数已保存至 {failed_params_path}，下次启动可单独重跑")
                         continue
 
             # 收集结果
