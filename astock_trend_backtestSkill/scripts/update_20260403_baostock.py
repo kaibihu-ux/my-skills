@@ -70,7 +70,7 @@ def main():
         df = fetch_one(code, target_date, target_date)
         if df is not None and not df.empty:
             try:
-                store.conn.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{target_date}'")
+                store.conn.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, target_date])
                 store.conn.execute(f"INSERT INTO stock_daily BY NAME SELECT * FROM df")
                 success += 1
             except Exception:
@@ -96,7 +96,7 @@ def main():
             df = fetch_one(code, target_date, target_date)
             if df is not None and not df.empty:
                 try:
-                    store.conn.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{target_date}'")
+                    store.conn.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, target_date])
                     store.conn.execute(f"INSERT INTO stock_daily BY NAME SELECT * FROM df")
                     retry_ok += 1
                     fail_codes.remove(code)

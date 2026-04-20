@@ -86,7 +86,7 @@ def write_one(code, df, con):
         try:
             # 先检查是否已存在
             exists = con.execute(
-                f"SELECT 1 FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{TARGET_DATE}' LIMIT 1"
+                "SELECT 1 FROM stock_daily WHERE ts_code = ? AND trade_date = ? LIMIT 1"
             ).fetchone()
             if exists:
                 return True  # 已存在，跳过

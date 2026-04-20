@@ -291,10 +291,8 @@ def _apply_adjustment(df: pd.DataFrame, ts_code: str, trade_date: str,
 
     # 查数据库中该股昨日收盘价（前复权基准）
     prev_date_q = store.conn.execute(
-        f"SELECT close FROM stock_daily "
-        f"WHERE ts_code = '{ts_code}' "
-        f"AND trade_date < '{trade_date}' "
-        f"ORDER BY trade_date DESC LIMIT 1"
+        "SELECT close FROM stock_daily WHERE ts_code = ? AND trade_date < ? ORDER BY trade_date DESC LIMIT 1",
+        [ts_code, trade_date]
     ).fetchone()
 
     if prev_date_q is None or prev_date_q[0] is None or prev_date_q[0] <= 0:
@@ -724,7 +722,8 @@ class DataManager:
                     dates = combined.loc[mask, 'trade_date'].unique()
                     for td in dates:
                         self.store.conn.execute(
-                            f"DELETE FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{td}'"
+                            "DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?",
+                            [ts_code, td]
                         )
                 self.store.conn.execute("INSERT INTO stock_daily BY NAME SELECT * FROM combined")
         except Exception as e:

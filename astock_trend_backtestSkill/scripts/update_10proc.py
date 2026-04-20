@@ -141,7 +141,7 @@ if __name__ == '__main__':
             if df is not None and not df.empty:
                 try:
                     exists = con.execute(
-                        f"SELECT 1 FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{TARGET_DATE}' LIMIT 1"
+                        "SELECT 1 FROM stock_daily WHERE ts_code = ? AND trade_date = ? LIMIT 1"
                     ).fetchone()
                     if not exists:
                         con.register('dft', df)

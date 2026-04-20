@@ -3,11 +3,18 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
+from cachetools import LRUCache
 
 
 class BacktestExecutor:
     """回测执行器"""
-    
+
+    # 【S-004 Fix】缓存容量上限：防止长周期回测（2020-2026年，1500+交易日）内存爆炸
+    # _price_by_date: 最多保留 1500 个交易日（~6年）
+    # _factor_by_date: 最多保留 1500 个交易日
+    # _price_cache / _factor_cache: 无上限（受 date 维度约束）
+    MAX_DATE_INDEX_SIZE = 1500
+
     def __init__(self, store, logger, config: Dict):
         self.store = store
         self.logger = logger
@@ -22,10 +29,11 @@ class BacktestExecutor:
         # 初始化中性化器
         self._init_neutralizer()
         # 数据预加载缓存（由 preload_data 填充，避免重复 SQL 查询）
+        # 【S-004 Fix】使用 LRU 缓存，超出容量自动淘汰最旧日期，防止内存爆炸
         self._price_cache = {}   # {(ts_code, trade_date): close_price}
         self._factor_cache = {}  # {(factor_name, ts_code, trade_date): value}
-        self._price_by_date = {} # {trade_date: {ts_code: close_price}}  # 日期索引，加速 _get_signals
-        self._factor_by_date = {}  # {trade_date: {factor_name: {ts_code: value}}}  # 因子缓存
+        self._price_by_date = LRUCache(maxsize=self.MAX_DATE_INDEX_SIZE)  # {trade_date: {ts_code: close_price}}
+        self._factor_by_date = LRUCache(maxsize=self.MAX_DATE_INDEX_SIZE)  # {trade_date: {factor_name: {ts_code: value}}}
         self._avg_vol_cache = {}  # {(ts_code, trade_date): avg_vol_20}  # 日均成交量缓存（用于中性化市值估算）
         self._industry_cache = {}  # {ts_code: industry}  # 行业缓存（静态数据，初始化时加载一次）
 
@@ -520,7 +528,8 @@ class BacktestExecutor:
             return self._price_cache.get((ts_code, date_str), 0.0)
         # 兜底：缓存未加载时查 DuckDB
         df = self.store.df(
-            f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date_str}'"
+            "SELECT close FROM stock_daily WHERE ts_code = ? AND trade_date = ?",
+            [ts_code, date_str]
         )
         if len(df) > 0:
             return float(df.iloc[0]['close'])

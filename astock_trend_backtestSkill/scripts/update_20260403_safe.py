@@ -105,7 +105,7 @@ for i, code in enumerate(to_fetch):
     df = fetch_one(code)
     if df is not None and not df.empty:
         try:
-            con.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{target_date}'")
+            con.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, target_date])
             con.register('df_to_insert', df)
             con.execute("INSERT INTO stock_daily BY NAME SELECT * FROM df_to_insert")
             con.unregister('df_to_insert')
@@ -139,7 +139,7 @@ if fail_codes:
         df = fetch_one(code)
         if df is not None and not df.empty:
             try:
-                con.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{target_date}'")
+                con.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, target_date])
                 con.register('df_to_insert', df)
                 con.execute("INSERT INTO stock_daily BY NAME SELECT * FROM df_to_insert")
                 con.unregister('df_to_insert')

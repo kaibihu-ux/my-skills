@@ -93,7 +93,7 @@ def main():
                 cols = ['ts_code','trade_date','open','high','low','close','vol','amount',
                         'pct_chg','limit_up','limit_down','is_st','suspended']
                 df = df[cols]
-                con.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{TARGET_DATE}'")
+                con.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, TARGET_DATE])
                 con.register('dft', df)
                 con.execute("INSERT INTO stock_daily BY NAME SELECT * FROM dft")
                 con.unregister('dft')

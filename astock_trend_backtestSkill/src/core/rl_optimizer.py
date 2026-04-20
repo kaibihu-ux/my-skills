@@ -150,8 +150,8 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
             for ts_code, pos in positions.items():
                 try:
                     df = pd.read_sql(
-                        f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
-                        conn
+                        "SELECT close FROM stock_daily WHERE ts_code = ? AND trade_date = ?",
+                        conn, params=[ts_code, date]
                     )
                     if not df.empty:
                         total += pos['shares'] * float(df.iloc[0]['close'])
@@ -161,8 +161,8 @@ def _episode_worker(args: Tuple) -> Tuple[float, List[int], Dict]:
 
         def get_close_price(ts_code, date):
             df = pd.read_sql(
-                f"SELECT close FROM stock_daily WHERE ts_code = '{ts_code}' AND trade_date = '{date}'",
-                conn
+                "SELECT close FROM stock_daily WHERE ts_code = ? AND trade_date = ?",
+                conn, params=[ts_code, date]
             )
             return float(df.iloc[0]['close']) if not df.empty else 0.0
 

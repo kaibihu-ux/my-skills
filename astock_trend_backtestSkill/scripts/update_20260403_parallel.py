@@ -84,7 +84,7 @@ def fetch_batch(codes):
 def write_one(code, df, con):
     if df is not None and not df.empty:
         try:
-            con.execute(f"DELETE FROM stock_daily WHERE ts_code = '{code}' AND trade_date = '{TARGET_DATE}'")
+            con.execute("DELETE FROM stock_daily WHERE ts_code = ? AND trade_date = ?", [code, TARGET_DATE])
             con.register('dft', df)
             con.execute("INSERT INTO stock_daily BY NAME SELECT * FROM dft")
             con.unregister('dft')
