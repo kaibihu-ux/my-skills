@@ -1179,6 +1179,15 @@ def job_step4_bayes(force_restart=False):
         }
         all_strategies = sg.generate_strategies(top_factors_for_gen, gen_param_space)
         print(f"[{now}] 策略候选: {len(all_strategies)} 个")
+        # 【Fix】保存所有候选策略到 strategy_pool 表
+        saved_count = 0
+        for strat in all_strategies:
+            try:
+                sg.save_strategy(strat)
+                saved_count += 1
+            except Exception as e:
+                logger.warning(f"策略 {strat.get('strategy_id', 'N/A')} 保存失败: {e}")
+        print(f"[{now}] strategy_pool 写入完成: {saved_count}/{len(all_strategies)} 个策略")
     except Exception as e:
         print(f"[{now}] ⚠️ 策略生成失败: {e}")
         all_strategies = []
@@ -1300,6 +1309,30 @@ def job_step5_final(force_restart=False):
             print(f"[{now}] 持仓写入完成: {len(final_positions)} 只股票")
         except Exception as e:
             logger.warning(f"持仓写入失败: {e}")
+
+    # ===== 【Fix】写入 backtest_nav（从 final_bt.nav_series 提取每日净值）=====
+    if final_bt and final_bt.get('nav_series') is not None:
+        print(f"[{now}] Step5.x: 写入 backtest_nav...")
+        try:
+            nav_series = final_bt.get('nav_series', [])
+            # nav_series 可能是 list[dict] 或 DataFrame
+            if hasattr(nav_series, 'to_dict'):
+                nav_rows = nav_series.to_dict('records')
+            elif isinstance(nav_series, list):
+                nav_rows = nav_series
+            else:
+                nav_rows = []
+            for nav_item in nav_rows:
+                nav_date = str(nav_item.get('date', ''))
+                nav_value = float(nav_item.get('nav', 1.0))
+                if nav_date and nav_value > 0:
+                    store.conn.execute(
+                        "INSERT OR REPLACE INTO backtest_nav (date, nav, updated_at) VALUES (?, ?, ?)",
+                        [nav_date, nav_value, datetime.now()]
+                    )
+            print(f"[{now}] backtest_nav 写入完成: {len(nav_rows)} 条净值记录")
+        except Exception as e:
+            logger.warning(f"backtest_nav 写入失败: {e}")
 
     # 过拟合检测
     print(f"[{now}] Step5.2: 过拟合检测...")
