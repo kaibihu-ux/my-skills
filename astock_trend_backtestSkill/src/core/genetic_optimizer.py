@@ -9,8 +9,10 @@ import numpy as np
 import random
 import json
 import threading
+import logging
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # 并行评估
 try:
@@ -18,6 +20,98 @@ try:
     HAS_JOBLIB = True
 except ImportError:
     HAS_JOBLIB = False
+
+
+# ---------------------------------------------------------------------------
+# P0-011 GA并行化：模块级 worker globals（每个子进程独立）
+# 每个子进程通过 initializer 创建自己的 BacktestExecutor，
+# 避免 DuckDB 连接无法 pickle 的问题。
+# ---------------------------------------------------------------------------
+_GA_WORKER_BACKTESTER = None  # 每个子进程独立的 BacktestExecutor 实例
+_GA_WORKER_START_DATE = None
+_GA_WORKER_END_DATE = None
+
+
+def _ga_worker_init(store_info: dict, config: dict, start_date: str, end_date: str):
+    """
+    ProcessPoolExecutor worker 初始化函数。
+    在每个子进程启动时调用一次，创建该进程专用的 BacktestExecutor。
+    """
+    global _GA_WORKER_BACKTESTER, _GA_WORKER_START_DATE, _GA_WORKER_END_DATE
+    _GA_WORKER_START_DATE = start_date
+    _GA_WORKER_END_DATE = end_date
+
+    # 在子进程中延迟导入，避免主进程也加载（import 触发执行时可能产生副作用）
+    import sys
+    _skill_root = Path(__file__).parent.parent
+    if str(_skill_root) not in sys.path:
+        sys.path.insert(0, str(_skill_root))
+
+    from src.core.duckdb_store import DuckDBStore
+    from src.core.backtester import BacktestExecutor
+
+    # 创建子进程独立的 DuckDBStore 连接（每个子进程有独立的 db 连接）
+    store = DuckDBStore(store_info)
+    logger = logging.getLogger("ga_worker")
+
+    _GA_WORKER_BACKTESTER = BacktestExecutor(store, logger, config)
+    # 预加载数据到子进程内存（copy-on-write，父进程 preload_data 的数据会复制过来）
+    _GA_WORKER_BACKTESTER.preload_data(start_date, end_date)
+
+
+def _ga_evaluate_worker(chrom: List) -> float:
+    """
+    子进程评估函数（每个染色体一次调用）。
+    使用子进程独立的 _GA_WORKER_BACKTESTER 执行回测。
+    """
+    global _GA_WORKER_BACKTESTER
+
+    bt = _GA_WORKER_BACKTESTER
+    if bt is None:
+        return -999.0
+
+    # ---- 解码 ----
+    factors = []
+    for i in range(5):
+        fid = chrom[i]
+        if fid != 0:
+            fname = {
+                1: 'momentum_20',
+                2: 'momentum_60',
+                3: 'volatility_20',
+                4: 'volume_ratio_20',
+                5: 'rsi_14',
+                6: 'macd',
+                7: 'bollinger_position',
+            }.get(fid)
+            if fname:
+                factors.append(fname)
+
+    holding_period_map = {0: 5, 1: 10, 2: 20, 3: 60}
+    stop_loss_map = {0: 0.05, 1: 0.10, 2: 0.15}
+    n_stocks_map = {0: 10, 1: 20, 2: 30}
+
+    params = {
+        'holding_period': holding_period_map.get(chrom[5], 20),
+        'stop_loss': stop_loss_map.get(chrom[6], 0.10),
+        'n_stocks': n_stocks_map.get(chrom[7], 20),
+        'take_profit': 0.20,
+    }
+
+    if not factors:
+        return -999.0
+
+    strategy = {
+        'strategy_id': 'ga_chromosome',
+        'strategy_name': 'ga_chromosome',
+        'factors': factors,
+    }
+
+    try:
+        result = bt.run(strategy, params, _GA_WORKER_START_DATE, _GA_WORKER_END_DATE)
+        return float(result.get('sharpe_ratio', -999.0))
+    except Exception:
+        return -999.0
 
 
 class GeneticOptimizer:
@@ -55,6 +149,7 @@ class GeneticOptimizer:
         elite_ratio: float = 0.2,
         tournament_size: int = 3,
         config: Dict = None,
+        n_jobs: int = 1,
     ):
         self.backtester = backtester
         self.logger = logger
@@ -70,8 +165,13 @@ class GeneticOptimizer:
         self.elite_ratio = elite_ratio
         self.tournament_size = tournament_size
 
-        # ---- 并行 + 检查点 ----
-        self._n_jobs = 1  # 顺序执行（DuckDB不可pickle）
+        # ---- P0-011 GA并行化 ----
+        # 从 backtester 提取 DuckDB 路径（用于子进程独立建连）
+        self._db_path = str(backtester.store.db_path) if hasattr(backtester, 'store') and hasattr(backtester.store, 'db_path') else None
+        # n_jobs > 1 时启用 ProcessPoolExecutor 并行评估（每代 population 并行）
+        self._n_jobs = max(1, n_jobs)
+
+        # ---- 检查点 ----
         # 检查点路径（由外部设置，或默认）
         self._checkpoint_path: Optional[Path] = None
         self._checkpoint_lock = threading.Lock()
@@ -181,78 +281,96 @@ class GeneticOptimizer:
         self.backtester.preload_data(self.start_date, self.end_date)
         self.logger.info("[GA] 预加载完成，开始进化...")
 
+        # ---- P0-011 GA并行化：创建进程池（在 preload_data 之后 fork）----
+        _pool = None
+        _use_parallel = self._n_jobs > 1 and self._db_path
+        if _use_parallel:
+            # fork 后子进程继承父进程地址空间（copy-on-write），
+            # 父进程 preload_data 后的内存数据会复制到每个子进程。
+            _pool = ProcessPoolExecutor(
+                max_workers=self._n_jobs,
+                initializer=_ga_worker_init,
+                initargs=(self._db_path, self.config, self.start_date, self.end_date),
+            )
+            self.logger.info(f"[GA] 进程池已创建 workers={self._n_jobs}")
+
         # ---- 主循环 ----
-        for gen in range(_resume_from, _resume_from + n_gens_to_run):
-            if HAS_JOBLIB and self._n_jobs > 1:
-                # 顺序执行（避免DuckDB无法pickle）
-                fitness_scores = [self._evaluate(chrom) for chrom in population]
-            else:
-                fitness_scores = [self._evaluate(chrom) for chrom in population]
+        try:
+            for gen in range(_resume_from, _resume_from + n_gens_to_run):
+                if _pool is not None:
+                    # P0-011 并行评估：用进程池并行评估整代 population
+                    futures = [_pool.submit(_ga_evaluate_worker, chrom) for chrom in population]
+                    fitness_scores = [f.result() for f in futures]
+                else:
+                    # 串行评估（默认，或 _db_path 不可用时）
+                    fitness_scores = [self._evaluate(chrom) for chrom in population]
 
-            best_idx = int(np.argmax(fitness_scores))
-            best_fitness = fitness_scores[best_idx]
-            avg_fitness = float(np.mean(fitness_scores))
+                best_idx = int(np.argmax(fitness_scores))
+                best_fitness = fitness_scores[best_idx]
+                avg_fitness = float(np.mean(fitness_scores))
 
-            self._fitness_history.append({
-                'gen': gen,
-                'best_sharpe': best_fitness,
-                'avg_sharpe': avg_fitness,
-            })
+                self._fitness_history.append({
+                    'gen': gen,
+                    'best_sharpe': best_fitness,
+                    'avg_sharpe': avg_fitness,
+                })
 
-            decoded = self._decode(population[best_idx])
+                decoded = self._decode(population[best_idx])
 
-            if best_fitness > self._current_best_sharpe:
-                self._current_best_sharpe = best_fitness
-                self._current_best_chrom = population[best_idx]
-                self._current_best_decoded = decoded
+                if best_fitness > self._current_best_sharpe:
+                    self._current_best_sharpe = best_fitness
+                    self._current_best_chrom = population[best_idx]
+                    self._current_best_decoded = decoded
 
-            # 修复P2：每代强制写盘改为智能保存（每5代或有新最优时保存）
-            should_save = (
-                best_fitness > self._current_best_sharpe  # 有新最优
-                or gen % 5 == 0  # 每5代定期保存
-                or gen == _resume_from  # 首代
-                or gen == _resume_from + n_gens_to_run - 1  # 末代
-            )
-            if should_save:
-                self._save_checkpoint(force=True)
+                # 修复P2：每代强制写盘改为智能保存（每5代或有新最优时保存）
+                should_save = (
+                    best_fitness > self._current_best_sharpe  # 有新最优
+                    or gen % 5 == 0  # 每5代定期保存
+                    or gen == _resume_from  # 首代
+                    or gen == _resume_from + n_gens_to_run - 1  # 末代
+                )
+                if should_save:
+                    self._save_checkpoint(force=True)
 
-            if timeout_checker and timeout_checker():
-                self.logger.info(f"[GA] 超时退出 Gen={gen}")
-                break
-
-            self.logger.info(
-                f"[GA] Gen {gen:3d} | Best={best_fitness:.4f} | "
-                f"Avg={avg_fitness:.4f} | Factors={decoded['factors']}"
-            )
-
-            # 提前终止
-            if len(self._fitness_history) > 10:
-                recent = [h['best_sharpe'] for h in self._fitness_history[-10:]]
-                if max(recent) - min(recent) < 0.001:
-                    self.logger.info(f"[GA] 提前终止 Gen={gen}")
+                if timeout_checker and timeout_checker():
+                    self.logger.info(f"[GA] 超时退出 Gen={gen}")
                     break
 
-            # 选择
-            selected = [self._select(population, fitness_scores) for _ in range(self.pop_size)]
-            # 交叉
-            offsprings = []
-            for i in range(0, len(selected) - 1, 2):
-                if random.random() < self.crossover_rate:
-                    c1, c2 = self._crossover(selected[i], selected[i + 1])
-                    offsprings.extend([c1, c2])
-                else:
-                    offsprings.extend([selected[i][:], selected[i + 1][:]])
-            # 突变
-            offsprings = [self._mutate(c) for c in offsprings]
-            # 精英保留
-            population = self._elitism(population, fitness_scores, offsprings, self.elite_ratio)
-            self._current_population = population
+                self.logger.info(
+                    f"[GA] Gen {gen:3d} | Best={best_fitness:.4f} | "
+                    f"Avg={avg_fitness:.4f} | Factors={decoded['factors']}"
+                )
 
-        # ---- 最终评估 ----
-        if HAS_JOBLIB and self._n_jobs > 1:
-            final_fitness = [self._evaluate(chrom) for chrom in population]
-        else:
-            final_fitness = [self._evaluate(chrom) for chrom in population]
+                # 提前终止
+                if len(self._fitness_history) > 10:
+                    recent = [h['best_sharpe'] for h in self._fitness_history[-10:]]
+                    if max(recent) - min(recent) < 0.001:
+                        self.logger.info(f"[GA] 提前终止 Gen={gen}")
+                        break
+
+                # 选择
+                selected = [self._select(population, fitness_scores) for _ in range(self.pop_size)]
+                # 交叉
+                offsprings = []
+                for i in range(0, len(selected) - 1, 2):
+                    if random.random() < self.crossover_rate:
+                        c1, c2 = self._crossover(selected[i], selected[i + 1])
+                        offsprings.extend([c1, c2])
+                    else:
+                        offsprings.extend([selected[i][:], selected[i + 1][:]])
+                # 突变
+                offsprings = [self._mutate(c) for c in offsprings]
+                # 精英保留
+                population = self._elitism(population, fitness_scores, offsprings, self.elite_ratio)
+                self._current_population = population
+        finally:
+            # 确保进程池被正确关闭
+            if _pool is not None:
+                _pool.shutdown(wait=True)
+                self.logger.info("[GA] 进程池已关闭")
+
+        # ---- 最终评估（串行，不走池，简化逻辑）----
+        final_fitness = [self._evaluate(chrom) for chrom in population]
 
         best_idx = int(np.argmax(final_fitness))
         best_chrom = population[best_idx]
